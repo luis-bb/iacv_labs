@@ -27,5 +27,4 @@ def extract_kp_fast():
 
     print("Found Keypoints: ", {len(keypoints)})
     
-    
 extract_kp_fast()
