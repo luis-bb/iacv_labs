@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
@@ -11,6 +13,30 @@ def to_gray(image):
 
 
 # ---------- OpenCV descriptors ----------
+
+
+def sift_descriptor(image, nfeatures=500):
+    gray = to_gray(image)
+    sift = cv2.SIFT_create(nfeatures=nfeatures, nOctaveLayers=3,
+                           contrastThreshold=0.03, edgeThreshold=10, sigma=1.6)
+    return sift.detectAndCompute(gray, None)
+
+
+def kaze_descriptor(image, threshold=0.001):
+    gray = to_gray(image)
+    # KAZE belongs to xfeatures2d in OpenCV 5.
+    create_kaze = cv2.KAZE_create if hasattr(cv2, "KAZE_create") else cv2.xfeatures2d.KAZE_create
+    kaze = create_kaze(threshold=threshold, nOctaves=4, nOctaveLayers=4)
+    return kaze.detectAndCompute(gray, None)
+
+
+def orb_descriptor(image, nfeatures=500):
+    gray = to_gray(image)
+    orb = cv2.ORB_create(nfeatures=nfeatures, scaleFactor=1.2, nlevels=8,
+                         edgeThreshold=31, firstLevel=0, WTA_K=2,
+                         scoreType=cv2.ORB_HARRIS_SCORE, patchSize=31,
+                         fastThreshold=20)
+    return orb.detectAndCompute(gray, None)
 
 def brief_descriptor(image, detector, brief_bytes=32):
     gray = to_gray(image)
@@ -119,15 +145,44 @@ def show_points(image, points, path="keypoints.png"):
     
     
     
+def save_results(image, keypoints, descriptors, name, folder="resultados/descriptors"):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    show_points(image, keypoints, path=folder / f"descriptors_{name}.png")
+    if descriptors is not None:
+        np.save(folder / f"descriptors_{name}.npy", descriptors)
+        print(f"{name.upper()} | Keypoints: {len(keypoints)} | Descriptors: {descriptors.shape}")
+    else:
+        print(f"{name.upper()} | No descriptors found")
+
+
 if __name__ == "__main__":
+    resultados = Path("resultados") / "descriptors"
+    resultados.mkdir(parents=True, exist_ok=True)
+
     loaded = cv2.imread("data/graf/img1.ppm")
-    assert loaded is not None, "Image not found"
+    if loaded is None:
+        raise FileNotFoundError("Image not found: data/graf/img1.ppm")
 
-    kps, desc = brisk_descriptor(loaded)
-    show_points(loaded, kps)
+    kps_sift, desc_sift = sift_descriptor(loaded)
+    save_results(loaded, kps_sift, desc_sift, "sift", resultados)
 
-    # Example: BRIEF / FREAK with a FAST detector
+    kps_kaze, desc_kaze = kaze_descriptor(loaded)
+    save_results(loaded, kps_kaze, desc_kaze, "kaze", resultados)
+
+    kps_orb, desc_orb = orb_descriptor(loaded)
+    save_results(loaded, kps_orb, desc_orb, "orb", resultados)
+
+    kps_brisk, desc_brisk = brisk_descriptor(loaded)
+    save_results(loaded, kps_brisk, desc_brisk, "brisk", resultados)
+
     fast = cv2.FastFeatureDetector_create()
+
     kps_b, desc_b = brief_descriptor(loaded, fast)
+    save_results(loaded, kps_b, desc_b, "brief", resultados)
+
     kps_f, desc_f = freak_descriptor(loaded, fast)
+    save_results(loaded, kps_f, desc_f, "freak", resultados)
+
     kps_m, desc_m = my_brief_descriptor(loaded, fast.detect(to_gray(loaded)))
+    save_results(loaded, kps_m, desc_m, "my_brief", resultados)
