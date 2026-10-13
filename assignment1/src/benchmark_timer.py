@@ -1,5 +1,8 @@
 """
-benchmark_timer.py - Medição rigorosa de tempo (Warm-up, Mediana, CPU/GPU)
+benchmark_timer.py – Rigorous timing: warm-up + median of N repeats.
+
+Separates detection, description, and matching times.
+Handles GPU sync for PyTorch models.
 """
 
 import time
@@ -8,86 +11,87 @@ import numpy as np
 
 try:
     import torch
+    HAS_TORCH = True
 except ImportError:
-    torch = None
+    HAS_TORCH = False
 
 
-def synchronize_device(is_gpu=False):
-    """Sincroniza o dispositivo CUDA se PyTorch estiver disponível e em uso."""
-    if is_gpu and torch is not None and torch.cuda.is_available():
+def _sync(is_gpu):
+    if is_gpu and HAS_TORCH and torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
-def benchmark_function(func, *args, is_gpu=False, num_repeats=5, **kwargs):
+def time_function(func, *args, is_gpu=False, n_repeats=5, **kwargs):
+    """1 warm-up + median of n_repeats.
+
+    Returns (result, median_seconds).
     """
-    Executa uma função com 1 warm-up e mede a mediana de pelo menos `num_repeats` repetições.
-    Separa a medição e lida com sincronização de GPU se aplicável.
-    
-    Args:
-        func: Função a ser medida (ex: detecção, descrição ou matching).
-        is_gpu: Booleano indicando se corre em GPU (ex: SuperPoint, D2-Net).
-        num_repeats: Número de repetições para o cálculo da mediana (default: 5).
-        
-    Returns:
-        tuple: (resultado da função na última execução, tempo mediano em segundos)
-    """
-    # 1. Execução de Warm-up (essencial para carregar caches, kernels CUDA, etc.)
-    synchronize_device(is_gpu)
+    # Warm-up
+    _sync(is_gpu)
     _ = func(*args, **kwargs)
-    synchronize_device(is_gpu)
+    _sync(is_gpu)
 
-    timings = []
+    times = []
     result = None
-
-    # 2. ≥ 5 repetições
-    for _ in range(num_repeats):
-        synchronize_device(is_gpu)
-        start_time = time.perf_counter()
-        
+    for _ in range(n_repeats):
+        _sync(is_gpu)
+        t0 = time.perf_counter()
         result = func(*args, **kwargs)
-        
-        synchronize_device(is_gpu)
-        end_time = time.perf_counter()
-        
-        timings.append(end_time - start_time)
+        _sync(is_gpu)
+        t1 = time.perf_counter()
+        times.append(t1 - t0)
 
-    # 3. Cálculo da mediana
-    median_time = statistics.median(timings)
-    
-    return result, median_time
+    return result, statistics.median(times)
 
 
-def measure_pipeline_steps(detector_describer_func, matcher_func, img, img_ref=None, is_gpu=False, num_repeats=5):
+def time_pipeline(method_name, gray1, gray2, max_keypoints=None,
+                  is_gpu=False, n_repeats=5):
+    """Time the full pipeline: detect → describe → match, separately.
+
+    Returns
+    -------
+    kps1, descs1, kps2, descs2, matches : results from the last run
+    times : dict with detect_ms, describe_ms, match_ms, total_ms
     """
-    Exemplo prático de como separar a medição de:
-    - Detecção & Descrição (combinadas ou separadas consoante a arquitetura)
-    - Matching
-    """
-    # Se a detecção e descrição forem juntas (ex: SIFT, ORB, SuperPoint)
-    def run_detect_describe():
-        return detector_describer_func(img)
+    from feature_extraction import detect_only, describe_only, extract
+    from matching import match_pipeline
+    import config as cfg
 
-    # Medir Detecção/Descrição
-    (kps, descs), time_det_desc = benchmark_function(
-        run_detect_describe, is_gpu=is_gpu, num_repeats=num_repeats
-    )
+    mcfg = cfg.METHOD_CONFIGS[method_name]
+    norm = mcfg["norm"]
 
-    time_matching = 0.0
-    matches = None
+    # --- Detection timing ---
+    def run_detect(img):
+        return detect_only(method_name, img, max_keypoints)
 
-    if img_ref is not None:
-        # Assumindo que temos os descritores da imagem de referência pré-calculados (descs_ref)
-        # Passamos para a função de matching
-        def run_matching():
-            return matcher_func(descs_ref, descs)
+    kps1, t_det1 = time_function(run_detect, gray1, is_gpu=is_gpu,
+                                  n_repeats=n_repeats)
+    kps2, t_det2 = time_function(run_detect, gray2, is_gpu=is_gpu,
+                                  n_repeats=n_repeats)
+    t_detect = (t_det1 + t_det2) / 2.0
 
-        # Se houver imagem de referência, medimos o matching em separado
-        # (Nota: ajusta os argumentos conforme a tua função real de matching)
-        pass 
+    # --- Description timing ---
+    def run_describe(img, kps):
+        return describe_only(method_name, img, kps)
 
-    return {
-        "keypoints": kps,
-        "descriptors": descs,
-        "time_detection_description_s": time_det_desc,
-        "time_matching_s": time_matching
+    (kps1, descs1), t_desc1 = time_function(run_describe, gray1, kps1,
+                                             is_gpu=is_gpu, n_repeats=n_repeats)
+    (kps2, descs2), t_desc2 = time_function(run_describe, gray2, kps2,
+                                             is_gpu=is_gpu, n_repeats=n_repeats)
+    t_describe = (t_desc1 + t_desc2) / 2.0
+
+    # --- Matching timing ---
+    def run_match():
+        return match_pipeline(descs1, descs2, norm)
+
+    matches, t_match = time_function(run_match, is_gpu=is_gpu,
+                                      n_repeats=n_repeats)
+
+    times = {
+        "detect_ms": t_detect * 1000,
+        "describe_ms": t_describe * 1000,
+        "match_ms": t_match * 1000,
+        "total_ms": (t_detect + t_describe + t_match) * 1000,
     }
+
+    return kps1, descs1, kps2, descs2, matches, times
