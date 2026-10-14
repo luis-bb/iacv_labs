@@ -1,16 +1,14 @@
 """
 stitching.py – Phase E: Image stitching pipeline.
 
-E1. stitch_pair: detect → describe → match → RANSAC → warp → blend
-E2. Mini RANSAC implementation
+E1. Sequence stitching: detect → describe → match → OpenCV RANSAC → warp → blend
 E3. RANSAC threshold study
 E4. Multi-method comparison
 E5. 3-image panorama with reference strategies
-E6. Blending (averaging + feathering)
+E6. Multi-band blending
 
 Usage:
-    cd src/
-    python stitching.py --demo
+    python src/stitching.py --sequence i_ajuntament
 """
 
 import os
@@ -22,440 +20,251 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import config as cfg
+from data_loader import get_sequence_dirs, load_image_color
 from feature_extraction import extract
 from matching import match_pipeline, estimate_homography, inlier_stats
 
 
-# ==================================================================
-# E1. stitch_pair
-# ==================================================================
+def _to_gray(image):
+    if image.ndim == 2:
+        return image
+    return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-def stitch_pair(img1, img2, method="SIFT", ratio=None, canvas_pad=0):
-    """Full stitching pipeline for two colour images.
 
-    img1 is the reference (stays fixed); img2 is warped onto img1's plane.
+def stitch_sequence(images, method="SIFT", ratio=None, reference_index=None):
+    """Estimate consecutive homographies and blend the sequence into a panorama.
 
-    Returns
-    -------
-    panorama : np.ndarray (BGR)
-    info     : dict with H, n_matches, n_inliers, inlier_ratio,
-               reproj_err, mask
+    Each adjacent homography maps image i to image i+1. With homogeneous
+    column-vector coordinates, transforms to reference r are composed as
+    T_r = I, T_i = T_(i+1) @ H_i for i < r, and
+    T_i = T_(i-1) @ inv(H_(i-1)) for i > r. The middle image is used by
+    default to limit the longest composition chain. Longer chains compound
+    pairwise estimation errors, increasing drift and visible misalignment.
+
+    Returned chain diagnostics measure the number of adjacent transforms and
+    sum their mean reprojection errors along all paths to the reference. The
+    latter is a comparison proxy, not a direct panorama alignment error.
     """
-    # Grayscale for features
-    g1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if img1.ndim == 3 else img1
-    g2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if img2.ndim == 3 else img2
+    if len(images) < 2:
+        return None, {"error": "At least two images are required"}
 
-    mcfg = cfg.METHOD_CONFIGS[method]
-    norm = mcfg["norm"]
+    if reference_index is None:
+        reference_index = len(images) // 2
+    if (not isinstance(reference_index, (int, np.integer))
+            or isinstance(reference_index, (bool, np.bool_))
+            or not 0 <= reference_index < len(images)):
+        return None, {
+            "error": f"Reference index must be between 0 and {len(images) - 1}"
+        }
 
-    kps1, descs1 = extract(method, g1)
-    kps2, descs2 = extract(method, g2)
+    images = [_to_gray(image) for image in images]
+    previous_image = images[0]
+    norm = cfg.METHOD_CONFIGS[method]["norm"]
+    previous_keypoints, previous_descriptors = extract(method, previous_image)
+    if previous_descriptors is None or len(previous_keypoints) < 4:
+        return None, {"error": "Not enough features in the reference image"}
 
-    if descs1 is None or descs2 is None or len(kps1) < 4 or len(kps2) < 4:
-        return None, {"error": "Not enough features"}
+    homographies = []
+    pair_stats = []
+    for image_index, image in enumerate(images[1:], start=2):
+        keypoints, descriptors = extract(method, image)
+        if descriptors is None or len(keypoints) < 4:
+            return None, {"error": f"Not enough features in image {image_index}"}
 
-    matches = match_pipeline(descs1, descs2, norm, ratio)
-    H, mask = estimate_homography(matches, kps1, kps2)
+        matches = match_pipeline(previous_descriptors, descriptors, norm, ratio)
+        homography, mask = estimate_homography(matches, previous_keypoints, keypoints)
+        if homography is None:
+            return None, {
+                "error": f"Could not align images {image_index - 1} and {image_index}"
+            }
 
-    if H is None:
-        return None, {"error": "RANSAC failed"}
-
-    n_inliers, reproj_err = inlier_stats(matches, kps1, kps2, H, mask)
-    inlier_ratio = n_inliers / len(matches) if matches else 0
-
-    # --- Build canvas ---
-    h1, w1 = img1.shape[:2]
-    h2, w2 = img2.shape[:2]
-
-    # Project corners of img2 through H_inv (since H maps 1→2,
-    # but we may want 2→1 depending on convention)
-    # Convention: matches are kps1 → kps2, so H maps pts from img1 to img2.
-    # To warp img2 onto img1's plane, we need H_inv.
-    H_inv = np.linalg.inv(H)
-
-    corners2 = np.float32([[0, 0], [w2, 0], [w2, h2], [0, h2]]).reshape(-1, 1, 2)
-    corners2_proj = cv2.perspectiveTransform(corners2, H_inv)
-
-    corners1 = np.float32([[0, 0], [w1, 0], [w1, h1], [0, h1]]).reshape(-1, 1, 2)
-    all_corners = np.vstack([corners1, corners2_proj])
-
-    x_min = int(np.floor(all_corners[:, 0, 0].min()))
-    y_min = int(np.floor(all_corners[:, 0, 1].min()))
-    x_max = int(np.ceil(all_corners[:, 0, 0].max()))
-    y_max = int(np.ceil(all_corners[:, 0, 1].max()))
-
-    # Translation to keep everything in positive coords
-    T = np.array([[1, 0, -x_min],
-                   [0, 1, -y_min],
-                   [0, 0, 1]], dtype=float)
-
-    W = x_max - x_min
-    H_canvas = y_max - y_min
-
-    # Warp img2 onto canvas
-    panorama = cv2.warpPerspective(img2, T @ H_inv, (W, H_canvas))
-
-    # Place img1 (reference) on canvas
-    panorama[-y_min:-y_min + h1, -x_min:-x_min + w1] = img1
-
-    info = {
-        "H": H,
-        "n_matches": len(matches),
-        "n_inliers": n_inliers,
-        "inlier_ratio": inlier_ratio,
-        "reproj_err": reproj_err,
-        "kps1": kps1,
-        "kps2": kps2,
-        "matches": matches,
-        "mask": mask,
-    }
-
-    return panorama, info
-
-
-# ==================================================================
-# E1 (improved). Averaging blend
-# ==================================================================
-
-def stitch_pair_averaged(img1, img2, method="SIFT", ratio=None):
-    """Stitch with per-pixel averaging in overlap regions."""
-    g1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if img1.ndim == 3 else img1
-    g2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if img2.ndim == 3 else img2
-
-    mcfg = cfg.METHOD_CONFIGS[method]
-    kps1, descs1 = extract(method, g1)
-    kps2, descs2 = extract(method, g2)
-
-    if descs1 is None or descs2 is None:
-        return None, {}
-
-    matches = match_pipeline(descs1, descs2, mcfg["norm"], ratio)
-    H, mask = estimate_homography(matches, kps1, kps2)
-    if H is None:
-        return None, {}
-
-    H_inv = np.linalg.inv(H)
-    h1, w1 = img1.shape[:2]
-    h2, w2 = img2.shape[:2]
-
-    corners2 = np.float32([[0, 0], [w2, 0], [w2, h2], [0, h2]]).reshape(-1, 1, 2)
-    corners2_proj = cv2.perspectiveTransform(corners2, H_inv)
-    corners1 = np.float32([[0, 0], [w1, 0], [w1, h1], [0, h1]]).reshape(-1, 1, 2)
-    all_corners = np.vstack([corners1, corners2_proj])
-
-    x_min = int(np.floor(all_corners[:, 0, 0].min()))
-    y_min = int(np.floor(all_corners[:, 0, 1].min()))
-    x_max = int(np.ceil(all_corners[:, 0, 0].max()))
-    y_max = int(np.ceil(all_corners[:, 0, 1].max()))
-
-    T = np.array([[1, 0, -x_min], [0, 1, -y_min], [0, 0, 1]], dtype=float)
-    W = x_max - x_min
-    Hc = y_max - y_min
-
-    # Warp img2
-    warped2 = cv2.warpPerspective(img2, T @ H_inv, (W, Hc)).astype(float)
-    mask2 = (warped2.sum(axis=2) > 0).astype(float)
-
-    # Place img1
-    canvas1 = np.zeros((Hc, W, 3), dtype=float)
-    oy, ox = -y_min, -x_min
-    canvas1[oy:oy + h1, ox:ox + w1] = img1.astype(float)
-    mask1 = (canvas1.sum(axis=2) > 0).astype(float)
-
-    # Average
-    total_mask = mask1 + mask2
-    total_mask[total_mask == 0] = 1  # avoid division by zero
-    panorama = ((canvas1 * mask1[:, :, np.newaxis] +
-                 warped2 * mask2[:, :, np.newaxis]) /
-                total_mask[:, :, np.newaxis]).astype(np.uint8)
-
-    n_inliers, reproj_err = inlier_stats(matches, kps1, kps2, H, mask)
-
-    return panorama, {
-        "H": H, "n_matches": len(matches),
-        "n_inliers": n_inliers, "reproj_err": reproj_err,
-    }
-
-
-# ==================================================================
-# E2. Mini RANSAC implementation
-# ==================================================================
-
-def mini_ransac(pts1, pts2, threshold=3.0, max_iters=2000,
-                confidence=0.995, seed=42):
-    """Minimal RANSAC for homography estimation (~30 lines).
-
-    Uses cv2.getPerspectiveTransform for the minimal 4-point model.
-    """
-    rng = np.random.RandomState(seed)
-    n = len(pts1)
-    if n < 4:
-        return None, None
-
-    best_H = None
-    best_inlier_mask = None
-    best_n_inliers = 0
-
-    for _ in range(max_iters):
-        # Sample 4 random correspondences
-        idx = rng.choice(n, 4, replace=False)
-        src = np.float32(pts1[idx]).reshape(4, 1, 2)
-        dst = np.float32(pts2[idx]).reshape(4, 1, 2)
-
-        # Minimal model
-        H_cand = cv2.getPerspectiveTransform(
-            src.reshape(4, 2), dst.reshape(4, 2))
-
-        if H_cand is None:
-            continue
-
-        # Project all pts1
-        pts1_h = np.hstack([pts1, np.ones((n, 1))])
-        proj = (H_cand @ pts1_h.T).T
-        proj = proj[:, :2] / proj[:, 2:3]
-
-        errors = np.linalg.norm(proj - pts2, axis=1)
-        inlier_mask = errors < threshold
-        n_inliers = inlier_mask.sum()
-
-        if n_inliers > best_n_inliers:
-            best_n_inliers = n_inliers
-            best_inlier_mask = inlier_mask.copy()
-
-            # Re-estimate on all inliers (if > 4)
-            if n_inliers >= 4:
-                inl_src = pts1[inlier_mask]
-                inl_dst = pts2[inlier_mask]
-                best_H, _ = cv2.findHomography(
-                    inl_src.reshape(-1, 1, 2),
-                    inl_dst.reshape(-1, 1, 2), 0)
-
-            # Adaptive stopping
-            w = n_inliers / n
-            if w > 0:
-                needed = np.log(1 - confidence) / np.log(1 - w ** 4)
-                if _ > needed:
-                    break
-
-    return best_H, best_inlier_mask
-
-
-# ==================================================================
-# E3. RANSAC threshold study
-# ==================================================================
-
-def ransac_threshold_study(img1, img2, method="SIFT", output_dir=None):
-    """Sweep RANSAC threshold and record inliers, error, panoramas."""
-    if output_dir is None:
-        output_dir = os.path.join(cfg.FIGURES_DIR, "ransac_study")
-    os.makedirs(output_dir, exist_ok=True)
-
-    g1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if img1.ndim == 3 else img1
-    g2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if img2.ndim == 3 else img2
-
-    mcfg = cfg.METHOD_CONFIGS[method]
-    kps1, descs1 = extract(method, g1)
-    kps2, descs2 = extract(method, g2)
-    matches = match_pipeline(descs1, descs2, mcfg["norm"])
-
-    thresholds = [0.5, 1, 2, 3, 5, 8, 10]
-    results = []
-
-    for t in thresholds:
-        pts1 = np.float32([kps1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-        pts2 = np.float32([kps2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-
-        H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, t,
-                                      maxIters=2000, confidence=0.995)
-
-        if H is not None and mask is not None:
-            n_inliers = int(mask.sum())
-            inlier_matches = [m for m, ok in zip(matches, mask.ravel()) if ok]
-            # Reprojection error on inliers
-            inl_pts1 = np.float32([kps1[m.queryIdx].pt for m in inlier_matches])
-            inl_pts2 = np.float32([kps2[m.trainIdx].pt for m in inlier_matches])
-            ones = np.ones((len(inl_pts1), 1))
-            proj = (H @ np.hstack([inl_pts1, ones]).T).T
-            proj = proj[:, :2] / proj[:, 2:3]
-            reproj = float(np.mean(np.linalg.norm(proj - inl_pts2, axis=1)))
-        else:
-            n_inliers = 0
-            reproj = float('inf')
-
-        results.append({
-            "threshold": t,
-            "n_inliers": n_inliers,
-            "inlier_ratio": n_inliers / len(matches) if matches else 0,
-            "reproj_err": reproj,
+        inliers, reproj_err = inlier_stats(
+            matches, previous_keypoints, keypoints, homography, mask)
+        homographies.append(homography)
+        pair_stats.append({
+            "image_index": image_index,
+            "from_image": image_index - 1,
+            "to_image": image_index,
+            "n_matches": len(matches),
+            "n_inliers": inliers,
+            "reproj_err": reproj_err,
         })
+        previous_keypoints = keypoints
+        previous_descriptors = descriptors
 
-        # Save panorama at this threshold
-        panorama, _ = stitch_pair_averaged(img1, img2, method)
-        if panorama is not None:
-            path = os.path.join(output_dir, f"panorama_t{t}.png")
-            cv2.imwrite(path, panorama)
+    transforms = [None] * len(images)
+    transforms[reference_index] = np.eye(3)
+    for image_index in range(reference_index - 1, -1, -1):
+        transforms[image_index] = (
+            transforms[image_index + 1] @ homographies[image_index])
+    for image_index in range(reference_index + 1, len(images)):
+        transforms[image_index] = (
+            transforms[image_index - 1] @ np.linalg.inv(homographies[image_index - 1]))
 
-    # Plot
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    ts = [r["threshold"] for r in results]
-    ax1.plot(ts, [r["n_inliers"] for r in results], "o-")
-    ax1.set_xlabel("RANSAC threshold (px)")
-    ax1.set_ylabel("Inliers")
-    ax1.set_title("Inliers vs threshold")
-    ax1.grid(True, alpha=0.3)
+    projected_corners = []
+    for image, transform in zip(images, transforms):
+        height, width = image.shape[:2]
+        corners = np.float32([[0, 0], [width, 0], [width, height], [0, height]])
+        projected_corners.append(
+            cv2.perspectiveTransform(corners.reshape(-1, 1, 2), transform))
 
-    ax2.plot(ts, [r["reproj_err"] for r in results], "o-", color="red")
-    ax2.set_xlabel("RANSAC threshold (px)")
-    ax2.set_ylabel("Mean reprojection error (px)")
-    ax2.set_title("Reprojection error vs threshold")
-    ax2.grid(True, alpha=0.3)
+    all_corners = np.vstack(projected_corners)
+    x_min = int(np.floor(all_corners[:, 0, 0].min()))
+    y_min = int(np.floor(all_corners[:, 0, 1].min()))
+    x_max = int(np.ceil(all_corners[:, 0, 0].max()))
+    y_max = int(np.ceil(all_corners[:, 0, 1].max()))
+    canvas_width = x_max - x_min
+    canvas_height = y_max - y_min
+    translation = np.array(
+        [[1, 0, -x_min], [0, 1, -y_min], [0, 0, 1]], dtype=float)
 
-    fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "ransac_threshold.png"), dpi=150)
-    plt.close(fig)
+    warped_images = []
+    masks = []
+    for image, transform in zip(images, transforms):
+        warp = translation @ transform
+        warped = cv2.warpPerspective(image, warp, (canvas_width, canvas_height))
+        source_mask = np.ones(image.shape[:2], dtype=np.uint8)
+        mask = cv2.warpPerspective(
+            source_mask, warp, (canvas_width, canvas_height),
+            flags=cv2.INTER_NEAREST)
+        warped_images.append(
+            cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR).astype(np.float32))
+        masks.append(mask * 255)
 
-    return results
+    seam_finder = cv2.detail_DpSeamFinder("COLOR")
+    seam_masks = [cv2.UMat(mask) for mask in masks]
+    seam_finder.find(
+        [cv2.UMat(image) for image in warped_images],
+        [(0, 0)] * len(warped_images),
+        seam_masks,
+    )
 
+    blender = cv2.detail_MultiBandBlender()
+    blender.setNumBands(5)
+    blender.prepare((0, 0, canvas_width, canvas_height))
+    for image, mask in zip(warped_images, seam_masks):
+        blender.feed(image.astype(np.int16), mask.get(), (0, 0))
 
-# ==================================================================
-# E5. 3-image panorama
-# ==================================================================
-
-def stitch_three(img1, img2, img3, method="SIFT", ref="center"):
-    """Stitch 3 images. ref='center' uses img2 as reference,
-    ref='left' uses img1.
-    """
-    g1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if img1.ndim == 3 else img1
-    g2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if img2.ndim == 3 else img2
-    g3 = cv2.cvtColor(img3, cv2.COLOR_BGR2GRAY) if img3.ndim == 3 else img3
-
-    mcfg = cfg.METHOD_CONFIGS[method]
-    norm = mcfg["norm"]
-
-    # Extract features
-    kps1, d1 = extract(method, g1)
-    kps2, d2 = extract(method, g2)
-    kps3, d3 = extract(method, g3)
-
-    # Match adjacent pairs: 1↔2 and 2↔3
-    m12 = match_pipeline(d1, d2, norm)
-    H12, _ = estimate_homography(m12, kps1, kps2)  # maps 1 → 2
-
-    m23 = match_pipeline(d2, d3, norm)
-    H23, _ = estimate_homography(m23, kps2, kps3)  # maps 2 → 3
-
-    if H12 is None or H23 is None:
-        print("Failed to estimate homography for one pair")
-        return None
-
-    h1, w1 = img1.shape[:2]
-    h2, w2 = img2.shape[:2]
-    h3, w3 = img3.shape[:2]
-
-    if ref == "center":
-        # Reference = img2
-        H1_to_ref = np.linalg.inv(H12)       # 1 → 2
-        H3_to_ref = np.linalg.inv(H23)       # 3 → 2
-        ref_img = img2
-        imgs_to_warp = [(img1, H1_to_ref), (img3, H3_to_ref)]
-    elif ref == "left":
-        # Reference = img1
-        H2_to_ref = H12  # already maps 1→2, need inv: H12 maps 1→2
-        # Actually H12 maps pts from img1 to img2.
-        # We need H that warps img2 to img1 plane: inv(H12)
-        H2_to_1 = np.linalg.inv(H12)
-        H3_to_1 = np.linalg.inv(H12) @ np.linalg.inv(H23)  # 3→2→1
-        ref_img = img1
-        imgs_to_warp = [(img2, H2_to_1), (img3, H3_to_1)]
-    else:
-        raise ValueError(f"Unknown ref: {ref}")
-
-    # Compute canvas size
-    ref_h, ref_w = ref_img.shape[:2]
-    all_corners = [np.float32([[0, 0], [ref_w, 0],
-                                [ref_w, ref_h], [0, ref_h]]).reshape(-1, 1, 2)]
-
-    for warp_img, H_w in imgs_to_warp:
-        hi, wi = warp_img.shape[:2]
-        c = np.float32([[0, 0], [wi, 0], [wi, hi], [0, hi]]).reshape(-1, 1, 2)
-        all_corners.append(cv2.perspectiveTransform(c, H_w))
-
-    all_pts = np.vstack(all_corners)
-    x_min = int(np.floor(all_pts[:, 0, 0].min()))
-    y_min = int(np.floor(all_pts[:, 0, 1].min()))
-    x_max = int(np.ceil(all_pts[:, 0, 0].max()))
-    y_max = int(np.ceil(all_pts[:, 0, 1].max()))
-
-    T = np.array([[1, 0, -x_min], [0, 1, -y_min], [0, 0, 1]], dtype=float)
-    W = x_max - x_min
-    Hc = y_max - y_min
-
-    # Accumulate with averaging
-    accum = np.zeros((Hc, W, 3), dtype=float)
-    count = np.zeros((Hc, W), dtype=float)
-
-    # Place reference
-    ref_warped = cv2.warpPerspective(ref_img, T, (W, Hc))
-    ref_mask = (ref_warped.sum(axis=2) > 0).astype(float)
-    accum += ref_warped.astype(float)
-    count += ref_mask
-
-    # Warp and accumulate others
-    for warp_img, H_w in imgs_to_warp:
-        warped = cv2.warpPerspective(warp_img, T @ H_w, (W, Hc))
-        w_mask = (warped.sum(axis=2) > 0).astype(float)
-        accum += warped.astype(float)
-        count += w_mask
-
-    count[count == 0] = 1
-    panorama = (accum / count[:, :, np.newaxis]).astype(np.uint8)
-
-    return panorama
+    panorama_bgr, _ = blender.blend(None, None)
+    panorama = cv2.cvtColor(
+        cv2.convertScaleAbs(panorama_bgr), cv2.COLOR_BGR2GRAY)
+    chain_lengths = [abs(image_index - reference_index)
+                     for image_index in range(len(images))]
+    path_reproj_errors = [
+        sum(pair_stats[edge_index]["reproj_err"]
+            for edge_index in range(min(image_index, reference_index),
+                                    max(image_index, reference_index)))
+        for image_index in range(len(images))
+    ]
+    return panorama, {
+        "pairs": pair_stats,
+        "reference_image": reference_index + 1,
+        "reference_index": reference_index,
+        "max_chain_hops": max(chain_lengths),
+        "mean_chain_hops": float(np.mean(chain_lengths)),
+        "summed_path_reproj_error_px": float(sum(path_reproj_errors)),
+    }
 
 
 # ==================================================================
-# E6. Feathering blend
-# ==================================================================
-
-def feathering_blend(img1_warped, mask1, img2_warped, mask2):
-    """Blend two warped images using distance-transform feathering."""
-    # Distance transforms
-    d1 = cv2.distanceTransform(mask1.astype(np.uint8), cv2.DIST_L2, 5)
-    d2 = cv2.distanceTransform(mask2.astype(np.uint8), cv2.DIST_L2, 5)
-
-    total = d1 + d2
-    total[total == 0] = 1
-
-    w1 = d1 / total
-    w2 = d2 / total
-
-    blended = (img1_warped.astype(float) * w1[:, :, np.newaxis] +
-               img2_warped.astype(float) * w2[:, :, np.newaxis])
-
-    return blended.astype(np.uint8)
-
-
-# ==================================================================
-# Main demo
+# Main
 # ==================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--img1", type=str, help="Path to first image")
-    parser.add_argument("--img2", type=str, help="Path to second image")
+    parser = argparse.ArgumentParser(
+        description="Stitch consecutive images into a panorama.",
+        epilog="Example: python src/stitching.py --image-dir data/Panorama "
+               "--images keble_a.jpg keble_b.jpg keble_c.jpg",
+    )
+    parser.add_argument("--sequence", type=str,
+                        help="HPatches sequence name to stitch using all six images")
+    parser.add_argument("--image-dir", type=str,
+                        help="Folder containing the custom input images")
+    parser.add_argument("--images", nargs="+",
+                        help="Ordered image filenames, from first to last")
+    parser.add_argument("--reference-index", type=int,
+                        help="1-based reference image index for comparison "
+                             "(default: middle image)")
     parser.add_argument("--method", type=str, default="SIFT")
-    parser.add_argument("--output", type=str, default="panorama.png")
+    parser.add_argument("--output", type=str)
     args = parser.parse_args()
 
-    if args.img1 and args.img2:
-        i1 = cv2.imread(args.img1)
-        i2 = cv2.imread(args.img2)
-        pano, info = stitch_pair_averaged(i1, i2, method=args.method)
-        if pano is not None:
-            cv2.imwrite(args.output, pano)
-            print(f"Panorama saved to {args.output}")
-            print(f"  Matches: {info['n_matches']}, Inliers: {info['n_inliers']}")
-        else:
-            print("Stitching failed")
+    if not any((args.sequence, args.image_dir, args.images)):
+        args.image_dir = os.path.join("data", "Panorama")
+        args.images = ["keble_a.jpg", "keble_b.jpg", "keble_c.jpg"]
+
+    if args.image_dir or args.images:
+        if not args.image_dir or not args.images:
+            parser.error("--image-dir and --images must be provided together")
+        if len(args.images) < 2:
+            parser.error("At least two image filenames are required")
+        if (args.reference_index is not None
+                and not 1 <= args.reference_index <= len(args.images)):
+            parser.error(
+                f"--reference-index must be between 1 and {len(args.images)}")
+
+        image_paths = [os.path.join(args.image_dir, name) for name in args.images]
+        missing = [path for path in image_paths if not os.path.isfile(path)]
+        if missing:
+            parser.error(f"Image files not found: {', '.join(missing)}")
+        images = [load_image_color(path)[0] for path in image_paths]
+        reference_index = (
+            None if args.reference_index is None else args.reference_index - 1)
+        panorama, info = stitch_sequence(
+            images, method=args.method, reference_index=reference_index)
+        if panorama is None:
+            parser.error(info["error"])
+
+        image_label = "_".join(
+            os.path.splitext(os.path.basename(name))[0] for name in args.images)
+        output_path = args.output or os.path.join(
+            "resultados", "stitching", f"{image_label}_panorama.png")
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        if not cv2.imwrite(output_path, panorama):
+            raise OSError(f"Could not save panorama to {output_path}")
+        print(f"Panorama saved to {output_path}")
+        print(f"Reference image: {args.images[info['reference_image'] - 1]}")
+        print(f"Maximum chain length: {info['max_chain_hops']} adjacent homographies")
+        print("Summed path reprojection error: "
+              f"{info['summed_path_reproj_error_px']:.3f} px (comparison proxy)")
+        for pair in info["pairs"]:
+            first = args.images[pair["from_image"] - 1]
+            second = args.images[pair["to_image"] - 1]
+            print(f"  Images {first} -> {second}: {pair['n_matches']} matches, "
+                  f"{pair['n_inliers']} inliers")
     else:
-        print("Usage: python stitching.py --img1 left.jpg --img2 right.jpg")
+        sequence_name = args.sequence or "v_adam"
+        sequence_dirs = dict(get_sequence_dirs())
+        if sequence_name not in sequence_dirs:
+            parser.error(f"HPatches sequence not found: {sequence_name}")
+
+        sequence_dir = sequence_dirs[sequence_name]
+        images = [
+            load_image_color(os.path.join(sequence_dir, f"{image_index}.ppm"))[0]
+            for image_index in range(1, 7)
+        ]
+        if (args.reference_index is not None
+                and not 1 <= args.reference_index <= len(images)):
+            parser.error(
+                f"--reference-index must be between 1 and {len(images)}")
+        reference_index = (
+            None if args.reference_index is None else args.reference_index - 1)
+        panorama, info = stitch_sequence(
+            images, method=args.method, reference_index=reference_index)
+        if panorama is None:
+            parser.error(info["error"])
+
+        output_path = args.output or os.path.join(
+            "resultados", "stitching", f"{sequence_name}_panorama.png")
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        if not cv2.imwrite(output_path, panorama):
+            raise OSError(f"Could not save panorama to {output_path}")
+        print(f"Panorama saved to {output_path}")
+        print(f"Reference image: {info['reference_image']}")
+        print(f"Maximum chain length: {info['max_chain_hops']} adjacent homographies")
+        print("Summed path reprojection error: "
+              f"{info['summed_path_reproj_error_px']:.3f} px (comparison proxy)")
+        for pair in info["pairs"]:
+            print(f"  Images {pair['from_image']} -> {pair['to_image']}: "
+                  f"{pair['n_matches']} matches, "
+                  f"{pair['n_inliers']} inliers")
