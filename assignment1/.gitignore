@@ -1,5 +1,5 @@
 ./.venv/
 data/
-hpatches-release.zip
-hpatches-release
 plan.md
+hpatches-sequences-release/
+src/__pycache__

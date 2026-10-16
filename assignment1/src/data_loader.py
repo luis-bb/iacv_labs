@@ -1,17 +1,8 @@
-"""
-data_loader.py – Load HPatches full-image sequences.
-
-Each sequence directory contains:
-    1.ppm … 6.ppm   (images)
-    H_1_2 … H_1_6   (3×3 homographies mapping img 1 → img k)
-"""
-
 import os
 import glob
 import cv2
 import numpy as np
 from pathlib import Path
-
 import config as cfg
 
 
