@@ -1,171 +1,139 @@
-"""
-own_brief.py – Custom BRIEF descriptor (Calonder et al. 2012).
-
-Sampling strategies
--------------------
-G I   : both points uniform over the patch
-G II  : both points isotropic Gaussian around the centre, σ² = S²/25
-G III : first point Gaussian σ² = S²/25, second Gaussian around the
-        first with σ² = S²/100
-
-Preprocessing: Gaussian blur 9×9, σ = 2 (paper setting).
-Patch size S = 48, default 256 tests (32 bytes).
-"""
-
 import numpy as np
-import cv2
+import random
+import visualization
+import cv2 
+import matplotlib.pyplot as plt
 
 
-# ------------------------------------------------------------------
-# Pair generation (deterministic, saved to disk, reused)
-# ------------------------------------------------------------------
+def generate_sampling_pairs(patch_size: int, num_pairs: int) -> list:
 
-def generate_pairs(strategy, n_bits=256, patch_size=48, seed=42):
-    """Generate (n_bits, 4) array of (x1, y1, x2, y2) offsets.
-
-    Each offset is in [-S/2, S/2) relative to patch centre.
-    """
-    rng = np.random.RandomState(seed)
-    half = patch_size // 2
-    sigma_main = patch_size / 5.0         # σ² = S²/25  → σ = S/5
-    sigma_fine = patch_size / 10.0        # σ² = S²/100 → σ = S/10
-
-    if strategy == "GI":
-        # Both uniform
-        pairs = rng.uniform(-half, half, size=(n_bits, 4))
-    elif strategy == "GII":
-        # Both isotropic Gaussian, clipped to patch
-        pairs = rng.normal(0, sigma_main, size=(n_bits, 4))
-    elif strategy == "GIII":
-        # First point: Gaussian σ_main; second: Gaussian around first, σ_fine
-        xy1 = rng.normal(0, sigma_main, size=(n_bits, 2))
-        xy2 = xy1 + rng.normal(0, sigma_fine, size=(n_bits, 2))
-        pairs = np.hstack([xy1, xy2])
-    else:
-        raise ValueError(f"Unknown strategy: {strategy}")
-
-    # Clip to patch and round to int
-    pairs = np.clip(pairs, -half, half - 1).round().astype(np.int32)
-    return pairs
+    coordinate_pairs = list()
+    max_offset = patch_size // 2
+    sigma = max_offset / 5
 
 
-def save_pairs(pairs, path):
-    np.save(path, pairs)
+    for _ in range(num_pairs):
+
+        p1 = np.random.normal(0,sigma, size=2)
+        p2 = np.random.normal(0,sigma, size=2)
+
+        p1 = np.round(p1).astype(int)
+        p2 = np.round(p2).astype(int)
+
+        p1 = np.clip(p1, -max_offset, max_offset)
+        p2 = np.clip(p2, -max_offset, max_offset)
+
+        coordinate_pairs.append((tuple(p1), tuple(p2)))
+    return coordinate_pairs
+
+def compute_single_descriptor(image: np.ndarray, 
+                              keypoint: tuple, 
+                              patch_size: int, 
+                              sampling_pairs: list) -> np.ndarray:
+
+    kx, ky = keypoint
+    max_offset = patch_size // 2
+
+    if (kx-max_offset< 0 or ky-max_offset<0 or kx + max_offset>=image.shape[1] or ky+max_offset>=image.shape[0]):
+        return None
+
+    descriptor = np.zeros(len(sampling_pairs), dtype = np.uint8)
+
+    for i, (p1, p2) in enumerate(sampling_pairs):
+        dx1, dy1 = p1
+        dx2, dy2 = p2
+
+        intensity1 = image[ky + dy1, kx + dx1]
+        intensity2 = image[ky + dy2, kx + dx2]
+
+        descriptor[i] = int(intensity1 < intensity2)
 
 
-def load_pairs(path):
-    return np.load(path)
+    return descriptor
+
+def compute_descriptors(image: np.ndarray, 
+                        keypoints: list, 
+                        patch_size: int = 31, 
+                        num_pairs: int = 256) -> list:
+
+    sampling_pairs = generate_sampling_pairs(patch_size, num_pairs)
+    descriptors = []
+
+    for keypoint in keypoints:
+
+        descriptor = compute_single_descriptor(image,
+                                                keypoint,
+                                                patch_size,
+                                                sampling_pairs)
+        if descriptors is not None:
+            descriptors.append(descriptor)
+
+    return descriptors
+
+    
 
 
-# ------------------------------------------------------------------
-# Descriptor computation
-# ------------------------------------------------------------------
+def compute_hamming_distance(desc1: np.ndarray, desc2: np.ndarray) -> int:
 
-def compute_own_brief(gray, keypoints, pairs, patch_size=48, smooth=True):
-    """Compute own BRIEF descriptors for a list of cv2.KeyPoint.
+    if len(desc1) != len(desc2):
+        raise ValueError("Descriptors must have same length")
 
-    Parameters
-    ----------
-    gray       : (H, W) uint8 image (already grayscale)
-    keypoints  : list of cv2.KeyPoint
-    pairs      : (n_bits, 4) int32 array of offsets
-    patch_size : int
-    smooth     : bool – apply Gaussian blur (paper default: True)
-
-    Returns
-    -------
-    kept_kps   : list of cv2.KeyPoint (border-safe)
-    descriptors: (N, n_bits//8) uint8 array, or empty
-    """
-    if smooth:
-        gray = cv2.GaussianBlur(gray, (9, 9), 2)
-
-    h, w = gray.shape[:2]
-    half = patch_size // 2
-    n_bits = pairs.shape[0]
-    n_bytes = n_bits // 8
-
-    # Vectorise: collect all valid keypoints first
-    kept_kps = []
-    centres = []
-    for kp in keypoints:
-        x, y = int(round(kp.pt[0])), int(round(kp.pt[1]))
-        if x < half or y < half or x >= w - half or y >= h - half:
-            continue
-        kept_kps.append(kp)
-        centres.append((x, y))
-
-    if len(centres) == 0:
-        return [], np.empty((0, n_bytes), dtype=np.uint8)
-
-    centres = np.array(centres, dtype=np.int32)  # (N, 2)
-
-    # Pixel coordinates for all keypoints × all pairs
-    # p coords: centre + (pairs[:, 0], pairs[:, 1])
-    # q coords: centre + (pairs[:, 2], pairs[:, 3])
-    px = centres[:, 0:1] + pairs[np.newaxis, :, 0]   # (N, n_bits)
-    py = centres[:, 1:2] + pairs[np.newaxis, :, 1]
-    qx = centres[:, 0:1] + pairs[np.newaxis, :, 2]
-    qy = centres[:, 1:2] + pairs[np.newaxis, :, 3]
-
-    # Clip to image bounds (safety, though border check above should suffice)
-    px = np.clip(px, 0, w - 1)
-    py = np.clip(py, 0, h - 1)
-    qx = np.clip(qx, 0, w - 1)
-    qy = np.clip(qy, 0, h - 1)
-
-    # Intensity lookups
-    p_vals = gray[py, px]  # (N, n_bits)
-    q_vals = gray[qy, qx]
-
-    # Bit rule: bit = 1 if I(p) < I(q)
-    bits = (p_vals < q_vals).astype(np.uint8)  # (N, n_bits)
-
-    # Pack into bytes
-    descriptors = np.packbits(bits, axis=1)  # (N, ceil(n_bits/8))
-    descriptors = descriptors[:, :n_bytes]   # exact trim
-
-    return kept_kps, descriptors
+    return int(np.count_nonzero(desc1 != desc2))
 
 
-# ------------------------------------------------------------------
-# Convenience: detect FAST + compute own BRIEF
-# ------------------------------------------------------------------
+def mybrief_run(image, keypoints_xy, patch_size, num_pair):
+    sampling_pairs = generate_sampling_pairs(patch_size, num_pair)
+    descriptors = []
+    valid_keypoints = []
 
-def detect_and_compute_own_brief(gray, strategy="GII", n_bits=256,
-                                  patch_size=48, smooth=True,
-                                  fast_threshold=20, seed=42,
-                                  max_keypoints=None,
-                                  fast_kp_size=31.0):
-    """Full pipeline: FAST detection → own BRIEF description.
+    for kp in keypoints_xy:
+        descriptors = compute_single_descriptor(image,
+                                                kp,
+                                                patch_size,
+                                                sampling_pairs)
+    if descriptor is not None:
+        descriptors.append(descriptor)
+        valid_keypoints.append(kp)
 
-    Returns (keypoints, descriptors).
-    """
-    # FAST detection
-    fast = cv2.FastFeatureDetector_create(
-        threshold=fast_threshold,
-        nonmaxSuppression=True,
-        type=cv2.FastFeatureDetector_TYPE_9_16,
-    )
-    kps = fast.detect(gray, None)
+    
+ 
 
-    # Set kp.size for consistency
-    for kp in kps:
-        kp.size = fast_kp_size
+if __name__ == "__main__":
 
-    # Generate (or reuse) pairs
-    pairs = generate_pairs(strategy, n_bits=n_bits,
-                           patch_size=patch_size, seed=seed)
+    image = np.random.randint(0,256,size = (100, 100), dtype = np.uint8)
+    keypoints = [(50,50),(30,30),(5,5)]
 
-    # Compute descriptor
-    kps, descs = compute_own_brief(gray, kps, pairs,
-                                    patch_size=patch_size, smooth=smooth)
+    descriptors = compute_descriptors(image,keypoints,patch_size=31, num_pairs=256)
 
-    # Budget
-    if max_keypoints is not None and len(kps) > max_keypoints:
-        # Sort by response (FAST score)
-        indices = np.argsort([-kp.response for kp in kps])[:max_keypoints]
-        kps = [kps[i] for i in indices]
-        descs = descs[indices]
+    for descriptor in descriptors:
+        if descriptor is not None:
+            print("Descriptor shape: ", descriptor.shape)
 
-    return kps, descs
+    if len(descriptors) >= 2:
+        distance = compute_hamming_distance(descriptors[0], descriptors[1])
+
+    print("Hamming Distance", distance)
+
+    from pathlib import Path
+    image_real = Path("./hpatches-sequences-release/i_ajuntament/1.ppm")
+    image_real = cv2.imread(image_real, cv2.IMREAD_GRAYSCALE)
+
+    plt.imshow(image_real, cmap = "gray")
+    plt.savefig("./SavingOwnBrief_real.jpg")
+
+    from detectors import fast_detector
+    import visualization
+    import sys
+
+
+    sys.exit(1)
+
+
+    keypoints = fast_detector(image_real)
+    print(f"Detected {len(keypoints)} Keypoints")
+
+
+    R = mybrief_run(image_real, keypoints_xy=keypoints, patch_size=31, num_pair=256)
+    print(R)
+
+
