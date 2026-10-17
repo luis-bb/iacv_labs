@@ -1,22 +1,86 @@
 """
-evaluation.py – All metrics for the HPatches benchmark (plan A2).
+evaluation.py — Quantitative metrics for the HPatches benchmark.
 
-Metrics
--------
+Implemented metrics
+-------------------
 1. Co-visible keypoints
-2. Repeatability (one-to-one, 3 px)
-3. #features = min(N1_vis, N2_vis)
-4. #correspondences = repeat_matches (max possible correct matches)
-5. PMR, Precision, Matching Score, Recall  + sanity check
-6. Homography accuracy (corner error ≤ 1, 3, 5 px)
-7. Inlier stats
-8. Memory footprint
+2. Repeatability (one-to-one assignment, geometric threshold)
+3. Feature count: min(N1_visible, N2_visible)
+4. Maximum repeatable correspondences
+5. PMR, precision, matching score, recall, and consistency checks
+6. Homography corner accuracy at configurable thresholds
+7. RANSAC inlier statistics and inlier reprojection error
+8. Runtime and descriptor-memory helpers
+
+Conventions
+-----------
+- Keypoint coordinates are (x, y) in the coordinate system of the images
+  passed to this module.
+- H maps image 1 coordinates to image 2 coordinates.
+- Correctness uses forward transfer error <= threshold_px.
+- Co-visibility means the projected keypoint centre falls inside the other
+  image; it does not model occlusion or the full keypoint support region.
+- Recall uses the maximum number of repeatable pairs as its denominator.
+- PMR = putative_matches / min(N1_visible, N2_visible).
+- Matching score = correct_matches / min(N1_visible, N2_visible).
 """
+
+from time import perf_counter
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+try:
+    import config as cfg
+except ImportError:
+    from src import config as cfg
 
-import config as cfg
+DEFAULT_THRESHOLD_PX = getattr(cfg, "CORRECT_MATCH_THRESHOLD_PX", 3.0)
+threshold_px = DEFAULT_THRESHOLD_PX
+
+
+# ------------------------------------------------------------------
+# Geometry helpers
+# ------------------------------------------------------------------
+
+def _keypoint_points(keypoints):
+    """Return keypoint coordinates as an (N, 2) float64 array."""
+    if not keypoints:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.asarray([kp.pt for kp in keypoints], dtype=np.float64).reshape(-1, 2)
+
+
+def _project_points(points, H, eps=1e-12):
+    """Project (N, 2) points with H; invalid projections become NaN."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(points) == 0:
+        return np.empty((0, 2), dtype=np.float64)
+
+    H = np.asarray(H, dtype=np.float64)
+    if H.shape != (3, 3) or not np.all(np.isfinite(H)):
+        raise ValueError("H must be a finite 3x3 homography.")
+
+    homogeneous = np.column_stack((points, np.ones(len(points))))
+    projected = (H @ homogeneous.T).T
+    denominator = projected[:, 2]
+
+    result = np.full((len(points), 2), np.nan, dtype=np.float64)
+    valid = np.isfinite(projected).all(axis=1) & (np.abs(denominator) > eps)
+    result[valid] = projected[valid, :2] / denominator[valid, None]
+    result[~np.isfinite(result).all(axis=1)] = np.nan
+    return result
+
+
+def _inside_image(points, shape):
+    """Boolean mask for finite points whose centres lie inside image bounds."""
+    height, width = shape[:2]
+    finite = np.isfinite(points).all(axis=1)
+    return (
+        finite
+        & (points[:, 0] >= 0)
+        & (points[:, 0] < width)
+        & (points[:, 1] >= 0)
+        & (points[:, 1] < height)
+    )
 
 
 # ------------------------------------------------------------------
@@ -24,229 +88,617 @@ import config as cfg
 # ------------------------------------------------------------------
 
 def get_covisible_indices(kps1, kps2, H, shape1, shape2):
-    """Project keypoints through H and its inverse; keep those landing
-    inside the other image.
-
-    Returns (vis1_idx, vis2_idx) – integer index arrays.
     """
-    h1, w1 = shape1[:2]
-    h2, w2 = shape2[:2]
-
-    pts1 = np.array([kp.pt for kp in kps1]) if len(kps1) else np.zeros((0, 2))
-    pts2 = np.array([kp.pt for kp in kps2]) if len(kps2) else np.zeros((0, 2))
-
-    if len(pts1) == 0 or len(pts2) == 0:
-        return np.array([], dtype=int), np.array([], dtype=int)
-
-    try:
-        H_inv = np.linalg.inv(H)
-    except np.linalg.LinAlgError:
-        return np.array([], dtype=int), np.array([], dtype=int)
-
-    # pts1 → img2
-    ones1 = np.ones((len(pts1), 1))
-    proj1 = (H @ np.hstack([pts1, ones1]).T).T
-    proj1 = proj1[:, :2] / proj1[:, 2:3]
-    mask1 = (proj1[:, 0] >= 0) & (proj1[:, 0] < w2) & \
-            (proj1[:, 1] >= 0) & (proj1[:, 1] < h2)
-
-    # pts2 → img1
-    ones2 = np.ones((len(pts2), 1))
-    proj2 = (H_inv @ np.hstack([pts2, ones2]).T).T
-    proj2 = proj2[:, :2] / proj2[:, 2:3]
-    mask2 = (proj2[:, 0] >= 0) & (proj2[:, 0] < w1) & \
-            (proj2[:, 1] >= 0) & (proj2[:, 1] < h1)
-
-    return np.where(mask1)[0], np.where(mask2)[0]
-
-
-# ------------------------------------------------------------------
-# 2. Repeatability (one-to-one via Hungarian)
-# ------------------------------------------------------------------
-
-def compute_repeatability(kps1, kps2, H, shape1, shape2,
-                          threshold_px=None):
-    """Repeatability with one-to-one assignment (linear_sum_assignment).
+    Return indices of keypoints whose projected centres lie inside the
+    opposite image.
 
     Returns
     -------
-    repeatability   : float
-    n_repeat        : int   – number of repeated pairs (= correspondences)
-    n1_vis, n2_vis  : int
-    n_features      : int   – min(n1_vis, n2_vis)
+    vis1_idx, vis2_idx : np.ndarray[int]
+        Indices of keypoints in image 1 and image 2, respectively.
+        Each image is handled independently, including when the other has
+        no keypoints.
+    """
+    pts1 = _keypoint_points(kps1)
+    pts2 = _keypoint_points(kps2)
+
+    try:
+        H = np.asarray(H, dtype=np.float64)
+        if H.shape != (3, 3) or not np.all(np.isfinite(H)):
+            return np.empty(0, dtype=int), np.empty(0, dtype=int)
+        H_inv = np.linalg.inv(H)
+    except (np.linalg.LinAlgError, ValueError):
+        return np.empty(0, dtype=int), np.empty(0, dtype=int)
+
+    projected_1_to_2 = _project_points(pts1, H)
+    projected_2_to_1 = _project_points(pts2, H_inv)
+
+    vis1 = np.flatnonzero(_inside_image(projected_1_to_2, shape2))
+    vis2 = np.flatnonzero(_inside_image(projected_2_to_1, shape1))
+    return vis1, vis2
+
+
+# ------------------------------------------------------------------
+# 2. Repeatability (one-to-one assignment)
+# ------------------------------------------------------------------
+
+def compute_repeatability(
+    kps1, kps2, H, shape1, shape2, threshold_px=None
+):
+    """
+    Compute one-to-one repeatability using the Hungarian algorithm.
+
+    The assignment first maximizes the number of pairs within the distance
+    threshold, then minimizes the total distance among those assignments.
+
+    Returns
+    -------
+    repeatability : float
+    n_repeat : int
+    n1_vis, n2_vis : int
+    n_features : int
+        min(n1_vis, n2_vis)
     """
     if threshold_px is None:
-        threshold_px = cfg.CORRECT_MATCH_THRESHOLD_PX
+        threshold_px = getattr(cfg, "CORRECT_MATCH_THRESHOLD_PX", DEFAULT_THRESHOLD_PX)
+    if threshold_px <= 0:
+        raise ValueError("threshold_px must be positive.")
 
     vis1, vis2 = get_covisible_indices(kps1, kps2, H, shape1, shape2)
     n1_vis, n2_vis = len(vis1), len(vis2)
+    n_features = min(n1_vis, n2_vis)
 
     if n1_vis == 0 or n2_vis == 0:
-        return 0.0, 0, n1_vis, n2_vis, 0
+        return 0.0, 0, n1_vis, n2_vis, n_features
 
-    pts1 = np.array([kps1[i].pt for i in vis1])
-    pts2 = np.array([kps2[i].pt for i in vis2])
+    pts1 = _keypoint_points(kps1)[vis1]
+    pts2 = _keypoint_points(kps2)[vis2]
+    projected = _project_points(pts1, H)
 
-    # Project pts1 → img2 through H
-    ones = np.ones((len(pts1), 1))
-    proj = (H @ np.hstack([pts1, ones]).T).T
-    proj = proj[:, :2] / proj[:, 2:3]
+    # Invalid projections are not expected after co-visibility filtering,
+    # but handle them defensively.
+    dist = np.linalg.norm(projected[:, None, :] - pts2[None, :, :], axis=2)
+    dist[~np.isfinite(dist)] = np.inf
+    valid = dist <= threshold_px
 
-    # Distance matrix: (n1_vis, n2_vis)
-    dist = np.linalg.norm(proj[:, np.newaxis, :] - pts2[np.newaxis, :, :],
-                          axis=2)
+    # Every valid edge costs at most threshold_px. A penalty greater than
+    # min(n1_vis, n2_vis) * threshold_px makes gaining one extra valid pair
+    # preferable to any possible change in the total valid-edge distance.
+    max_valid_pairs = min(n1_vis, n2_vis)
+    penalty = (max_valid_pairs + 1) * (threshold_px + 1.0)
+    cost = np.where(valid, dist, penalty)
 
-    # Hungarian (minimise total distance)
-    row_ind, col_ind = linear_sum_assignment(dist)
-
-    # Count valid (< threshold)
-    n_repeat = int(sum(1 for r, c in zip(row_ind, col_ind)
-                       if dist[r, c] < threshold_px))
-
-    n_features = min(n1_vis, n2_vis)
-    repeatability = n_repeat / n_features if n_features > 0 else 0.0
+    rows, cols = linear_sum_assignment(cost)
+    n_repeat = int(np.count_nonzero(valid[rows, cols]))
+    repeatability = n_repeat / n_features if n_features else 0.0
 
     return repeatability, n_repeat, n1_vis, n2_vis, n_features
 
 
 # ------------------------------------------------------------------
-# 5. PMR, Precision, Matching Score, Recall + sanity check
+# 3. Geometric correctness of descriptor matches
 # ------------------------------------------------------------------
 
-def compute_matching_metrics(n_putatives, n_correct, n_features,
-                             n_correspondences):
-    """Compute all four metrics and run the mandatory sanity check.
+def count_correct_matches(
+    keypoints1, keypoints2, matches, H, threshold_px=None
+):
+    """
+    Count geometrically correct putative matches using ground-truth H.
 
     Parameters
     ----------
-    n_putatives      : int – number of putative matches (after one-to-one)
-    n_correct        : int – number of correct matches (< 3 px via GT H)
-    n_features       : int – min(N1_vis, N2_vis)
-    n_correspondences: int – repeatability count (max possible correct)
+    keypoints1, keypoints2
+        Keypoint lists used to produce `matches`.
+    matches
+        OpenCV DMatch objects, e.g. after KNN ratio filtering and any
+        one-to-one filtering required by the chosen protocol.
+    H
+        Ground-truth homography mapping image 1 to image 2.
+    threshold_px
+        A match is correct when forward transfer error <= threshold_px.
 
-    Returns dict with PMR, Precision, Matching_Score, Recall.
+    Returns
+    -------
+    n_correct : int
+    errors_px : np.ndarray
+        Forward transfer errors for each input match, in match order.
+    correct_mask : np.ndarray[bool]
     """
-    pmr = n_putatives / n_features if n_features > 0 else 0.0
-    precision = n_correct / n_putatives if n_putatives > 0 else 0.0
-    ms = n_correct / n_features if n_features > 0 else 0.0
-    recall = n_correct / n_correspondences if n_correspondences > 0 else 0.0
+    if threshold_px is None:
+        threshold_px = getattr(cfg, "CORRECT_MATCH_THRESHOLD_PX", DEFAULT_THRESHOLD_PX)
+    if threshold_px <= 0:
+        raise ValueError("threshold_px must be positive.")
 
-    # Sanity checks (A2.6)
-    assert abs(ms - pmr * precision) < 1e-9, \
-        f"Sanity fail: MS={ms:.6f} != PMR*Prec={pmr*precision:.6f}"
-    assert recall <= 1.0 + 1e-9, f"Recall > 1: {recall}"
+    if not matches:
+        return 0, np.empty(0, dtype=float), np.empty(0, dtype=bool)
 
-    return {
+    pts1 = np.asarray(
+        [keypoints1[m.queryIdx].pt for m in matches], dtype=np.float64
+    )
+    pts2 = np.asarray(
+        [keypoints2[m.trainIdx].pt for m in matches], dtype=np.float64
+    )
+    projected = _project_points(pts1, H)
+    errors = np.linalg.norm(projected - pts2, axis=1)
+    correct = np.isfinite(errors) & (errors <= threshold_px)
+    return int(correct.sum()), errors, correct
+
+
+# ------------------------------------------------------------------
+# 4. PMR, precision, matching score, recall + sanity checks
+# ------------------------------------------------------------------
+
+def compute_matching_metrics(
+    n_putatives, n_correct, n_features, n_correspondences
+):
+    """
+    Calculate PMR, precision, matching score and recall.
+
+    Definitions
+    -----------
+    PMR = n_putatives / n_features
+    Precision = n_correct / n_putatives
+    Matching_Score = n_correct / n_features
+    Recall = n_correct / n_correspondences
+
+    Here n_correspondences is the maximum number of repeatable pairs
+    computed by compute_repeatability().
+
+    Zero-denominator metrics are returned as 0.0. Counts must follow the
+    same one-to-one matching protocol and geometric threshold.
+    """
+    counts = {
         "n_putatives": n_putatives,
         "n_correct": n_correct,
         "n_features": n_features,
         "n_correspondences": n_correspondences,
+    }
+    for name, value in counts.items():
+        if not isinstance(value, (int, np.integer)) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer.")
+
+    if n_correct > n_putatives:
+        raise ValueError("n_correct cannot exceed n_putatives.")
+    if n_correct > n_correspondences:
+        raise ValueError(
+            "n_correct exceeds n_correspondences. Check one-to-one matching, "
+            "co-visibility, and whether both use the same geometric threshold."
+        )
+
+    pmr = n_putatives / n_features if n_features else 0.0
+    precision = n_correct / n_putatives if n_putatives else 0.0
+    matching_score = n_correct / n_features if n_features else 0.0
+    recall = n_correct / n_correspondences if n_correspondences else 0.0
+
+    if not np.isclose(matching_score, pmr * precision, atol=1e-9, rtol=0.0):
+        raise AssertionError(
+            "Metric consistency check failed: Matching_Score != PMR * Precision."
+        )
+    if recall > 1.0 + 1e-9:
+        raise AssertionError(f"Recall exceeds 1: {recall}")
+
+    return {
+        **counts,
         "PMR": pmr,
         "Precision": precision,
-        "Matching_Score": ms,
+        "Matching_Score": matching_score,
         "Recall": recall,
     }
 
 
 # ------------------------------------------------------------------
-# 7. Homography accuracy (corner error)
+# 5. Homography accuracy
 # ------------------------------------------------------------------
 
-def compute_homography_accuracy(H_est, H_gt, img_shape):
-    """Mean corner error and accuracy at 1, 3, 5 px thresholds.
-
-    If H_est is None (RANSAC failed), error = ∞ and accuracy = 0.
+def homography_corner_errors(H_est, H_gt, image_shape):
     """
-    if H_est is None:
-        return {
-            "mean_corner_err": float('inf'),
-            "HA@1": 0.0, "HA@3": 0.0, "HA@5": 0.0,
-        }
+    Compare estimated and ground-truth homographies using forward transfer
+    errors at the four image corners.
 
-    h, w = img_shape[:2]
-    corners = np.array([
-        [0,     0,     1],
-        [w - 1, 0,     1],
-        [w - 1, h - 1, 1],
-        [0,     h - 1, 1],
-    ], dtype=float).T  # (3, 4)
+    H_est and H_gt must map image 1 coordinates to image 2 coordinates.
+    image_shape is the shape of image 1.
 
-    proj_gt = H_gt @ corners
-    proj_gt = proj_gt[:2] / proj_gt[2:3]
-
-    proj_est = H_est @ corners
-    proj_est = proj_est[:2] / proj_est[2:3]
-
-    errs = np.linalg.norm(proj_gt - proj_est, axis=0)  # (4,)
-    mean_err = float(np.mean(errs))
-
-    return {
-        "mean_corner_err": mean_err,
-        "HA@1": float(mean_err <= 1.0) * 100,
-        "HA@3": float(mean_err <= 3.0) * 100,
-        "HA@5": float(mean_err <= 5.0) * 100,
-    }
-
-
-# ------------------------------------------------------------------
-# 9. Memory footprint
-# ------------------------------------------------------------------
-
-def compute_memory(n_kps, method_name):
-    """N_kps × bytes_per_descriptor."""
-    mcfg = cfg.METHOD_CONFIGS.get(method_name, {})
-    bpd = mcfg.get("bytes_per_desc", 64)
-    return n_kps * bpd
-
-
-# ------------------------------------------------------------------
-# Full evaluation for one pair
-# ------------------------------------------------------------------
-
-def evaluate_pair(kps1, descs1, kps2, descs2, H_gt, shape1, shape2,
-                  matches, correct_matches, incorrect_matches,
-                  H_est, ransac_mask, method_name):
-    """Run all metrics for a single image pair.
-
-    Returns a flat dict ready for CSV export.
+    Returns the four Euclidean corner transfer errors in pixels.
     """
-    # Repeatability and co-visibility
-    rep, n_repeat, n1v, n2v, n_feat = compute_repeatability(
-        kps1, kps2, H_gt, shape1, shape2)
+    if H_est is None or H_gt is None:
+        return np.full(4, np.nan, dtype=float)
 
-    n_correspondences = n_repeat  # A2.4
+    height, width = image_shape[:2]
+    corners = np.array(
+        [
+            [0.0, 0.0],
+            [width - 1.0, 0.0],
+            [width - 1.0, height - 1.0],
+            [0.0, height - 1.0],
+        ],
+        dtype=np.float64,
+    )
 
-    # Matching metrics
-    n_putatives = len(matches)
-    n_correct = len(correct_matches)
-    mm = compute_matching_metrics(n_putatives, n_correct,
-                                  n_feat, n_correspondences)
+    try:
+        est = _project_points(corners, H_est)
+        gt = _project_points(corners, H_gt)
+    except (ValueError, np.linalg.LinAlgError):
+        return np.full(4, np.nan, dtype=float)
 
-    # Homography accuracy
-    ha = compute_homography_accuracy(H_est, H_gt, shape1)
+    return np.linalg.norm(est - gt, axis=1)
 
-    # Inlier stats
-    from matching import inlier_stats
-    n_inliers, reproj_err = inlier_stats(matches, kps1, kps2,
-                                          H_est, ransac_mask)
 
-    # Memory
-    mem = compute_memory(len(kps1), method_name)
+def homography_accuracy(H_est, H_gt, image_shape, thresholds=(1, 3, 5)):
+    """
+    Summarize homography corner transfer error.
+
+    The per-pair corner error is the mean Euclidean transfer error over the
+    four image-1 corners. Each threshold result is a Boolean indicating
+    whether this pair's mean corner error is <= that threshold. Aggregate
+    these Booleans across pairs to report benchmark accuracy percentages.
+    """
+    errors = homography_corner_errors(H_est, H_gt, image_shape)
+    finite = np.isfinite(errors)
+    mean_error = float(errors.mean()) if finite.all() else float("nan")
 
     result = {
-        "n_kps1": len(kps1),
-        "n_kps2": len(kps2),
-        "n1_vis": n1v,
-        "n2_vis": n2v,
-        "n_features": n_feat,
-        "repeatability": rep,
-        "n_correspondences": n_correspondences,
+        "corner_errors_px": errors,
+        "mean_corner_error_px": mean_error,
+        "max_corner_error_px": (
+            float(errors.max()) if finite.all() else float("nan")
+        ),
     }
-    result.update(mm)
-    result.update(ha)
-    result.update({
-        "n_inliers": n_inliers,
-        "reproj_err_inliers": reproj_err,
-        "memory_bytes": mem,
-    })
+    for threshold in thresholds:
+        result[f"homography_correct_le_{threshold}px"] = (
+            bool(mean_error <= threshold) if np.isfinite(mean_error) else False
+        )
     return result
+
+
+# ------------------------------------------------------------------
+# 6. RANSAC inlier statistics
+# ------------------------------------------------------------------
+
+def compute_inlier_metrics(
+    keypoints1, keypoints2, matches, inlier_mask, H_est=None
+):
+    """
+    Calculate inlier count/ratio and mean forward reprojection error.
+
+    `inlier_mask` is the mask returned by cv2.findHomography for the exact
+    match list passed to that function.
+    """
+    n_matches = len(matches)
+    if inlier_mask is None:
+        mask = np.zeros(n_matches, dtype=bool)
+    else:
+        mask = np.asarray(inlier_mask).reshape(-1).astype(bool)
+        if len(mask) != n_matches:
+            raise ValueError("inlier_mask length must equal len(matches).")
+
+    n_inliers = int(mask.sum())
+    result = {
+        "n_ransac_matches": n_matches,
+        "n_ransac_inliers": n_inliers,
+        "ransac_inlier_ratio": n_inliers / n_matches if n_matches else 0.0,
+        "mean_inlier_reprojection_error_px": float("nan"),
+    }
+
+    if H_est is not None and n_inliers:
+        inlier_matches = [m for m, keep in zip(matches, mask) if keep]
+        _, errors, _ = count_correct_matches(
+            keypoints1, keypoints2, inlier_matches, H_est, threshold_px=float("inf")
+        )
+        finite = np.isfinite(errors)
+        if finite.any():
+            result["mean_inlier_reprojection_error_px"] = float(errors[finite].mean())
+
+    return result
+
+
+# ------------------------------------------------------------------
+# 7. Runtime and descriptor-memory helpers
+# ------------------------------------------------------------------
+
+def time_call(function, *args, repeats=None, **kwargs):
+    """
+    Time a callable repeatedly and return (last_result, timing_dict).
+
+    `function` should perform only the stage being timed, so detection,
+    description, and matching can be measured independently.
+    """
+    if repeats is None:
+        repeats = getattr(cfg, "TIMING_REPEATS", 5)
+    if repeats < 1:
+        raise ValueError("repeats must be at least 1.")
+
+    durations = []
+    result = None
+    for _ in range(repeats):
+        start = perf_counter()
+        result = function(*args, **kwargs)
+        durations.append(perf_counter() - start)
+
+    return result, {
+        "runtime_mean_s": float(np.mean(durations)),
+        "runtime_std_s": float(np.std(durations)),
+        "runtime_median_s": float(np.median(durations)),
+        "runtime_repeats": repeats,
+    }
+
+
+def descriptor_memory(descriptors):
+    """
+    Estimate descriptor-array storage in bytes.
+
+    This is the NumPy array's payload size; it excludes keypoint objects,
+    Python/OpenCV overhead, and temporary matching allocations.
+    """
+    if descriptors is None:
+        return {
+            "descriptor_count": 0,
+            "descriptor_dim": 0,
+            "descriptor_dtype": None,
+            "descriptor_bytes_each": 0,
+            "descriptor_memory_bytes": 0,
+        }
+
+    descriptors = np.asarray(descriptors)
+    if descriptors.ndim != 2:
+        raise ValueError("descriptors must be a 2D array.")
+
+    n_descriptors, dimension = descriptors.shape
+    bytes_each = int(dimension * descriptors.dtype.itemsize)
+    return {
+        "descriptor_count": int(n_descriptors),
+        "descriptor_dim": int(dimension),
+        "descriptor_dtype": str(descriptors.dtype),
+        "descriptor_bytes_each": bytes_each,
+        "descriptor_memory_bytes": int(descriptors.nbytes),
+    }
+
+
+# ------------------------------------------------------------------
+# 8. Standalone testing
+# ------------------------------------------------------------------
+
+if __name__ == "__main__":
+    from pathlib import Path
+    import cv2
+
+    threshold_px = getattr(cfg, "CORRECT_MATCH_THRESHOLD_PX", DEFAULT_THRESHOLD_PX)
+
+    data = Path("hpatches-sequences-release/i_ajuntament/")
+
+    image_path1 = data / "1.ppm"
+    image_path2 = data / "2.ppm" 
+
+    print("=" * 70)
+    print("EVALUATION MODULE TEST")
+    print("=" * 70)
+    print(f"Image 1: {image_path1}")
+    print(f"Image 2: {image_path2}")
+
+    # --------------------------------------------------------------
+    # Load images
+    # --------------------------------------------------------------
+    image1 = cv2.imread(str(image_path1), cv2.IMREAD_GRAYSCALE)
+    image2 = cv2.imread(str(image_path2), cv2.IMREAD_GRAYSCALE)
+
+    if image1 is None or image2 is None:
+        raise RuntimeError("Failed to load one or both images.")
+
+    print(f"Image 1 shape: {image1.shape}")
+    print(f"Image 2 shape: {image2.shape}")
+
+    # --------------------------------------------------------------
+    # Detect keypoints and compute descriptors
+    # --------------------------------------------------------------
+    sift = cv2.SIFT_create()
+
+    keypoints1, descriptors1 = sift.detectAndCompute(image1, None)
+    keypoints2, descriptors2 = sift.detectAndCompute(image2, None)
+
+    print("\n--- Feature Detection ---")
+    print(f"Keypoints in image 1: {len(keypoints1)}")
+    print(f"Keypoints in image 2: {len(keypoints2)}")
+
+    if descriptors1 is None or descriptors2 is None:
+        raise RuntimeError("No descriptors were detected in one or both images.")
+
+    # Test descriptor-memory helpers.
+    print("\n--- Descriptor Memory ---")
+    print("Image 1:", descriptor_memory(descriptors1))
+    print("Image 2:", descriptor_memory(descriptors2))
+
+    # --------------------------------------------------------------
+    # Match descriptors
+    # --------------------------------------------------------------
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+
+    def match_descriptors():
+        knn_matches = matcher.knnMatch(
+            descriptors1, descriptors2, k=2
+        )
+
+        return [
+            m
+            for pair in knn_matches
+            if len(pair) == 2
+            for m, n in [pair]
+            if m.distance < 0.75 * n.distance
+        ]
+
+    matches, timing = time_call(match_descriptors)
+
+    # Enforce one-to-one matching.
+    matches.sort(key=lambda m: m.distance)
+
+    unique_matches = []
+    used_query = set()
+    used_train = set()
+
+    for match in matches:
+        if (
+            match.queryIdx not in used_query
+            and match.trainIdx not in used_train
+        ):
+            unique_matches.append(match)
+            used_query.add(match.queryIdx)
+            used_train.add(match.trainIdx)
+
+    matches = unique_matches
+
+    print("\n--- Descriptor Matching ---")
+    print(f"Ratio-filtered, one-to-one matches: {len(matches)}")
+    print(f"Matching runtime: {timing['runtime_mean_s']:.6f} s")
+
+    if len(matches) < 4:
+        raise RuntimeError(
+            "At least four matches are required to estimate a homography."
+        )
+
+    # --------------------------------------------------------------
+    # Estimate homography using RANSAC
+    # --------------------------------------------------------------
+    points1 = np.float32(
+        [keypoints1[m.queryIdx].pt for m in matches]
+    ).reshape(-1, 1, 2)
+
+    points2 = np.float32(
+        [keypoints2[m.trainIdx].pt for m in matches]
+    ).reshape(-1, 1, 2)
+
+    H_est, inlier_mask = cv2.findHomography(
+        points1,
+        points2,
+        cv2.RANSAC,
+        threshold_px,
+    )
+
+    if H_est is None or inlier_mask is None:
+        raise RuntimeError("RANSAC failed to estimate a homography.")
+
+    inlier_mask = inlier_mask.ravel().astype(bool)
+
+    print("\n--- Estimated Homography ---")
+    print(H_est)
+
+    # --------------------------------------------------------------
+    # Test co-visibility and repeatability
+    # --------------------------------------------------------------
+    vis1, vis2 = get_covisible_indices(
+        keypoints1,
+        keypoints2,
+        H_est,
+        image1.shape,
+        image2.shape,
+    )
+
+    (
+        repeatability,
+        n_repeat,
+        n1_visible,
+        n2_visible,
+        n_features,
+    ) = compute_repeatability(
+        keypoints1,
+        keypoints2,
+        H_est,
+        image1.shape,
+        image2.shape,
+        threshold_px,
+    )
+
+    print("\n--- Co-Visibility ---")
+    print(f"Visible keypoints in image 1: {len(vis1)}")
+    print(f"Visible keypoints in image 2: {len(vis2)}")
+
+    print("\n--- Repeatability ---")
+    print(f"Visible keypoints in image 1: {n1_visible}")
+    print(f"Visible keypoints in image 2: {n2_visible}")
+    print(f"Feature count: {n_features}")
+    print(f"Repeatable correspondences: {n_repeat}")
+    print(f"Repeatability: {repeatability:.4f}")
+
+    # --------------------------------------------------------------
+    # Evaluate geometrically correct descriptor matches
+    # --------------------------------------------------------------
+    visible_matches = [
+        m for m in matches
+        if m.queryIdx in set(vis1)
+        and m.trainIdx in set(vis2)
+    ]
+
+    n_correct, errors, correct_mask = count_correct_matches(
+        keypoints1,
+        keypoints2,
+        visible_matches,
+        H_est,
+        threshold_px,
+    )
+
+    n_putatives = len(visible_matches)
+
+    print("\n--- Geometric Match Evaluation ---")
+    print(f"Putative matches: {n_putatives}")
+    print(f"Correct matches: {n_correct}")
+
+    if len(errors):
+        finite_errors = errors[np.isfinite(errors)]
+
+        if len(finite_errors):
+            print(
+                f"Mean forward transfer error: "
+                f"{finite_errors.mean():.4f} px"
+            )
+
+    # The matching metrics include a consistency check requiring
+    # n_correct <= n_correspondences. With an estimated homography,
+    # this is not guaranteed, so report any inconsistency explicitly.
+    if n_correct <= n_repeat:
+        matching_metrics = compute_matching_metrics(
+            n_putatives=n_putatives,
+            n_correct=n_correct,
+            n_features=n_features,
+            n_correspondences=n_repeat,
+        )
+
+        print("\n--- Matching Metrics ---")
+        for name, value in matching_metrics.items():
+            print(f"{name}: {value}")
+    else:
+        print(
+            "\nMatching metrics skipped: the number of correct matches "
+            "exceeds the repeatability-based correspondence count. "
+            "Check the estimated homography and matching protocol."
+        )
+
+    # --------------------------------------------------------------
+    # Test RANSAC inlier statistics
+    # --------------------------------------------------------------
+    inlier_metrics = compute_inlier_metrics(
+        keypoints1,
+        keypoints2,
+        matches,
+        inlier_mask,
+        H_est,
+    )
+
+    print("\n--- RANSAC Inlier Metrics ---")
+    for name, value in inlier_metrics.items():
+        print(f"{name}: {value}")
+
+    # --------------------------------------------------------------
+    # Test homography accuracy helper
+    # --------------------------------------------------------------
+    # No ground-truth homography is available here, so compare H_est
+    # against itself to verify the function's expected behaviour.
+    accuracy = homography_accuracy(
+        H_est,
+        H_est,
+        image1.shape,
+    )
+
+    print("\n--- Homography Accuracy (Sanity Check) ---")
+    for name, value in accuracy.items():
+        print(f"{name}: {value}")
+
+    print("\n" + "=" * 70)
+    print("EVALUATION TEST COMPLETED")
+    print("=" * 70)

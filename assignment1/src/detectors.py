@@ -38,35 +38,5 @@ def orb_detector(image, nfeatures=1000):
     return orb.detect(gray, None)
 
 
-# ---------- Display ----------
-
-def show_points(image, points, path="keypoints.png"):
-    out = cv2.drawKeypoints(image, points, None, color=(0, 255, 0),
-                            flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-    plt.figure(figsize=(10, 6))
-    plt.imshow(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
-    plt.axis("off")
-    plt.savefig(path, bbox_inches="tight", dpi=150)
-    plt.close()
-    print(f"Saved to {path} | Keypoints: {len(points)}")
-
-
 if __name__ == "__main__":
-    resultados = Path("resultados") / "detectors"
-    resultados.mkdir(parents=True, exist_ok=True)
-
-    loaded = cv2.imread("data/graf/img1.ppm")
-    if loaded is None:
-        raise FileNotFoundError("Image not found: data/graf/img1.ppm")
-
-    kps_sift = sift_detector(loaded)
-    show_points(loaded, kps_sift, path=resultados / "keypoints_sift.png")
-
-    kps_fast = fast_detector(loaded)
-    show_points(loaded, kps_fast, path=resultados / "keypoints_fast.png")
-
-    kps_kaze = kaze_detector(loaded)
-    show_points(loaded, kps_kaze, path=resultados / "keypoints_kaze.png")
-
-    kps_orb = orb_detector(loaded)
-    show_points(loaded, kps_orb, path=resultados / "keypoints_orb.png")
+    pass
