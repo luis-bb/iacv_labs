@@ -122,23 +122,8 @@ def get_covisible_indices(kps1, kps2, H, shape1, shape2):
 # 2. Repeatability (one-to-one assignment)
 # ------------------------------------------------------------------
 
-def compute_repeatability(
-    kps1, kps2, H, shape1, shape2, threshold_px=None
-):
-    """
-    Compute one-to-one repeatability using the Hungarian algorithm.
+def compute_repeatability(kps1, kps2, H, shape1, shape2, threshold_px=None):
 
-    The assignment first maximizes the number of pairs within the distance
-    threshold, then minimizes the total distance among those assignments.
-
-    Returns
-    -------
-    repeatability : float
-    n_repeat : int
-    n1_vis, n2_vis : int
-    n_features : int
-        min(n1_vis, n2_vis)
-    """
     if threshold_px is None:
         threshold_px = getattr(cfg, "CORRECT_MATCH_THRESHOLD_PX", DEFAULT_THRESHOLD_PX)
     if threshold_px <= 0:
