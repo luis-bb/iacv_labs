@@ -10,6 +10,12 @@ import config as cfg
 # Image helpers
 # ------------------------------------------------------------------
 
+def _read_image(path, flags):
+    """Read an image from a path, including paths with Unicode characters."""
+    image_data = np.fromfile(str(path), dtype=np.uint8)
+    return cv2.imdecode(image_data, flags)
+
+
 def load_image_gray(path, max_side=None):
     """Load an image as grayscale, optionally cap its longest side.
 
@@ -18,7 +24,7 @@ def load_image_gray(path, max_side=None):
     gray : np.ndarray  (H, W) uint8
     scale : float      resize factor applied (1.0 if none)
     """
-    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    img = _read_image(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise FileNotFoundError(f"Cannot read image: {path}")
 
@@ -39,7 +45,7 @@ def load_image_gray(path, max_side=None):
 
 def load_image_color(path, max_side=None):
     """Same as above but returns BGR for stitching / visualisation."""
-    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    img = _read_image(path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"Cannot read image: {path}")
 
@@ -141,3 +147,25 @@ def iter_pairs(sequences, max_side=None):
         for k in cfg.TARGET_IMAGE_INDICES:
             img1, img2, H = load_pair(seq_dir, k, max_side)
             yield seq_name, cat, k, img1, img2, H
+
+
+def load_stitching_image(path, max_side=None):
+    """Colour input plus exact resize metadata; max_side=0 disables resizing.
+
+    Part 1 loaders retain their existing return signatures.
+    """
+    max_side = cfg.PART2_MAX_SIDE if max_side is None else max_side
+    if max_side < 0:
+        raise ValueError('max_side cannot be negative')
+    path = Path(path)
+    image = _read_image(path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f'Could not load {path}')
+    h, w = image.shape[:2]
+    if max_side and max(h, w) > max_side:
+        scale = max_side / max(h, w)
+        image = cv2.resize(image, (max(1, round(w*scale)), max(1, round(h*scale))),
+                           interpolation=cv2.INTER_AREA)
+    return image, {'path': str(path), 'original_width': w, 'original_height': h,
+                   'processed_width': image.shape[1], 'processed_height': image.shape[0],
+                   'scale_x': image.shape[1]/w, 'scale_y': image.shape[0]/h}

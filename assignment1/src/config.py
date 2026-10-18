@@ -204,3 +204,14 @@ RATIO_SWEEP = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 RESULTS_DIR = "results"
 CSV_DIR = f"{RESULTS_DIR}/csv"
 FIGURES_DIR = f"{RESULTS_DIR}/figures"
+
+# Part 2: shared classical parameters above; stitching-specific experiment defaults.
+PART2_METHODS = ('SIFT', 'KAZE', 'ORB', 'FAST+BRIEF', 'FAST+BRISK',
+                 'FAST+FREAK', 'SuperPoint+NN', 'SUPERPOINT_LIGHTGLUE')
+# OwnBRIEF_GI/GII/GIII are not exposed: own_brief.py does not implement these variants.
+PART2_COMPARE_METHODS = ('SIFT', 'ORB', 'KAZE', 'SUPERPOINT_LIGHTGLUE')
+PART2_RANSAC_THRESHOLDS = (1.0, 3.0, 5.0)
+PART2_MAX_SIDE = 1600
+PART2_MAX_CANVAS_PIXELS = 20000000
+PART2_LIGHTGLUE_THRESHOLD = 0.1
+PART2_OUTPUT_DIR = 'resultados/stitching'
