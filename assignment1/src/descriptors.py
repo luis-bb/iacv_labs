@@ -12,6 +12,9 @@ Keypoints may be removed if the descriptor extractor cannot describe them.
 
 import cv2
 import numpy as np
+from pathlib import Path
+from time import perf_counter
+from detectors import fast_detector, kaze_detector
 
 
 def to_gray(image):
@@ -44,29 +47,27 @@ def _validate_keypoints(keypoints):
 
 def compute_sift_descriptors(image, keypoints):
     """Compute SIFT descriptors for existing keypoints."""
-    gray = to_gray(image)
     keypoints = _validate_keypoints(keypoints)
 
     extractor = cv2.SIFT_create()
-    return extractor.compute(gray, keypoints)
+    return extractor.compute(image, keypoints)
 
 
 def compute_kaze_descriptors(image, keypoints):
     """Compute KAZE descriptors for existing keypoints."""
-    gray = to_gray(image)
+
     keypoints = _validate_keypoints(keypoints)
 
-    extractor = cv2.KAZE_create()
-    return extractor.compute(gray, keypoints)
+    extractor = cv2.xfeatures2d.KAZE_create()
+    return extractor.compute(image, keypoints)
 
 
 def compute_orb_descriptors(image, keypoints):
     """Compute ORB descriptors for existing keypoints."""
-    gray = to_gray(image)
     keypoints = _validate_keypoints(keypoints)
 
     extractor = cv2.ORB_create()
-    return extractor.compute(gray, keypoints)
+    return extractor.compute(image, keypoints)
 
 
 def compute_brief_descriptors(image, keypoints, bytes=32):
@@ -76,7 +77,6 @@ def compute_brief_descriptors(image, keypoints, bytes=32):
     Requires opencv-contrib-python, which provides cv2.xfeatures2d.
     The default descriptor length is 32 bytes (256 bits).
     """
-    gray = to_gray(image)
     keypoints = _validate_keypoints(keypoints)
 
     if not hasattr(cv2, "xfeatures2d"):
@@ -91,16 +91,15 @@ def compute_brief_descriptors(image, keypoints, bytes=32):
         )
 
     extractor = cv2.xfeatures2d.BriefDescriptorExtractor_create(bytes=bytes)
-    return extractor.compute(gray, keypoints)
+    return extractor.compute(image, keypoints)
 
 
 def compute_brisk_descriptors(image, keypoints):
     """Compute BRISK descriptors for existing keypoints."""
-    gray = to_gray(image)
     keypoints = _validate_keypoints(keypoints)
 
-    extractor = cv2.BRISK_create()
-    return extractor.compute(gray, keypoints)
+    extractor = cv2.xfeatures2d.BRISK_create()
+    return extractor.compute(image, keypoints)
 
 
 def compute_freak_descriptors(image, keypoints):
@@ -109,7 +108,6 @@ def compute_freak_descriptors(image, keypoints):
 
     Requires opencv-contrib-python, which provides cv2.xfeatures2d.
     """
-    gray = to_gray(image)
     keypoints = _validate_keypoints(keypoints)
 
     if not hasattr(cv2, "xfeatures2d"):
@@ -124,7 +122,7 @@ def compute_freak_descriptors(image, keypoints):
         )
 
     extractor = cv2.xfeatures2d.FREAK_create()
-    return extractor.compute(gray, keypoints)
+    return extractor.compute(image, keypoints)
 
 
 def match(descriptors1, descriptors2, cross_check=True):
@@ -158,6 +156,74 @@ def match(descriptors1, descriptors2, cross_check=True):
 
     return sorted(matches, key=lambda m: m.distance)
 
+DESCRIPTORS = {
+    "SIFT": compute_sift_descriptors,
+    "KAZE": compute_kaze_descriptors,
+    "ORB": compute_orb_descriptors,
+    "BRISK": compute_brisk_descriptors,
+    "BRIEF": compute_brief_descriptors,
+    "FREAK": compute_freak_descriptors,
+}
+
+
+def compare_descriptors(image):
+    keypoints = fast_detector(image)
+    results = {}
+
+    for name, extractor in DESCRIPTORS.items():
+        start = perf_counter()
+
+        try:
+            if name == "BRIEF":
+                described_keypoints, desc = extractor(image, keypoints)
+            elif name == "KAZE":
+                keypoints = kaze_detector(image)
+                described_keypoints, desc = extractor(image,keypoints)
+            else:
+                described_keypoints, desc = extractor(image, keypoints)
+
+            elapsed_ms = (perf_counter() - start) * 1000
+
+            results[name] = {
+                "num_keypoints": len(described_keypoints or []),
+                "time_ms": elapsed_ms,
+                "dimensions": desc.shape[1] if desc is not None else 0,
+                "memory_bytes": desc.nbytes if desc is not None else 0,
+            }
+
+        except (RuntimeError, cv2.error) as error:
+            results[name] = {"error": str(error)}
+
+    return results
+
 
 if __name__ == "__main__":
-    pass
+    testing_imgs = Path("data/graf")
+
+    image_paths = [
+        testing_imgs / "img1.ppm",
+        testing_imgs / "img2.ppm",
+        testing_imgs / "img4.ppm",
+    ]
+
+    for image_path in image_paths:
+        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+
+        if image is None:
+            print(f"Could not read {image_path}")
+            continue
+
+        print(f"\n--- {image_path.name} ---")
+        results = compare_descriptors(image)
+
+        for name, result in results.items():
+            if "error" in result:
+                print(f"{name}: unavailable ({result['error']})")
+            else:
+                print(
+                    f"{name:<8} "
+                    f"keypoints={result['num_keypoints']:<5} "
+                    f"time={result['time_ms']:.2f} ms  "
+                    f"dimensions={result['dimensions']:<4} "
+                    f"memory={result['memory_bytes']} bytes"
+                )
