@@ -1,0 +1,4 @@
+./.venv/
+assignment1/data/
+assignment1/hpatches-sequences-release/
+assignment1/src/__pycache__
