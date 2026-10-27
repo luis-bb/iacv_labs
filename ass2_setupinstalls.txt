@@ -1,0 +1,11 @@
+# 1. Install required build tools and packages into your virtual environment
+uv pip install numpy cython setuptools
+
+# 2. Install the system-level C library header required by cyvlfeat
+sudo apt update && sudo apt install -y libvlfeat-dev
+
+# 3. Add cyvlfeat to your project and build it using your active environment
+uv add cyvlfeat --no-build-isolation
+
+
+uv pip install pandas matplotlib scikit-learn scikit-image opencv-contrib-python 
