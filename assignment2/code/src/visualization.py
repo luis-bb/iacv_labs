@@ -58,17 +58,20 @@ def displayPrecisionRecallCurve(labels, scores, title="Precision-Recall Curve"):
 
 class RelevantVisualWordsDisplay:
 
-    def __init__(self, img, w, encoder):
+    def __init__(self, img, w, encoder, hellinger=False):
         # compute features and get the visual words
         # img = standarizeImage(img_file)
         hist, words, distances, kpts = encoder.get_visual_words(img)
-        hist = np.sqrt(hist) # Hellinger kernel
+        if hellinger:
+            hist = np.sqrt(hist)
         hist = hist / (np.sum(hist**2) + 1e-10)**0.5 # L2 normalize
     
         # fold the w vetor, which may have been computed with spatial subdivisions
-        w_ = w.reshape(hist.shape[0],-1)
-        w_ = np.mean(w_, axis=1) # average the weights for each visual word
-        weights = w_ * hist # get weights for each visual word
+        # O encoder concatena os histogramas por quadrante.
+        w_ = w.reshape(-1, hist.shape[0])
+        w_ = np.mean(w_, axis=0) # average the weights for each visual word
+        # Aproximação global: agrega os pesos das regiões.
+        weights = w_ * hist
 
         self.img = img
         self.hist = hist
