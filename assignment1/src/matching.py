@@ -105,7 +105,8 @@ def classify_matches(matches, kps1, kps2, H_gt, threshold_px=None):
 # Homography estimation
 # ------------------------------------------------------------------
 
-def estimate_homography(matches, kps1, kps2):
+def estimate_homography(matches, kps1, kps2, threshold=None, max_iters=None,
+                        confidence=None, seed=None):
     """Estimate homography with RANSAC from putative matches.
 
     Returns
@@ -119,12 +120,14 @@ def estimate_homography(matches, kps1, kps2):
     pts1 = np.float32([kps1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
     pts2 = np.float32([kps2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
 
+    if seed is not None:
+        cv2.setRNGSeed(int(seed))
     H, mask = cv2.findHomography(
         pts1, pts2,
         method=cfg.RANSAC_METHOD,
-        ransacReprojThreshold=cfg.RANSAC_REPROJ_THRESHOLD,
-        maxIters=cfg.RANSAC_MAX_ITERS,
-        confidence=cfg.RANSAC_CONFIDENCE,
+        ransacReprojThreshold=cfg.RANSAC_REPROJ_THRESHOLD if threshold is None else threshold,
+        maxIters=cfg.RANSAC_MAX_ITERS if max_iters is None else max_iters,
+        confidence=cfg.RANSAC_CONFIDENCE if confidence is None else confidence,
     )
     return H, mask
 
@@ -224,3 +227,20 @@ def match_flann_binary(desc1, desc2, ratio=None):
         if m.distance < ratio * n.distance:
             good.append(m)
     return enforce_one_to_one(good)
+
+
+def match_mutual_ratio(desc1, desc2, norm_type, ratio=None):
+    """Part 2: ratio test in BOTH directions, then mutual consistency.
+
+    Part 1 match_pipeline keeps its original one-to-one filtering protocol.
+    """
+    ratio = cfg.RATIO_TEST_THRESHOLD if ratio is None else ratio
+    if not 0 < ratio < 1:
+        raise ValueError('ratio must be between zero and one')
+    if desc1 is None or desc2 is None or min(len(desc1), len(desc2)) < 2:
+        return []
+    forward = match_knn_ratio(desc1, desc2, norm_type, ratio)
+    reverse = match_knn_ratio(desc2, desc1, norm_type, ratio)
+    backward = {(m.trainIdx, m.queryIdx) for m in reverse}
+    return sorted((m for m in forward if (m.queryIdx, m.trainIdx) in backward),
+                  key=lambda m: m.distance)
