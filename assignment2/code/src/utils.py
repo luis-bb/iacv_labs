@@ -19,11 +19,9 @@ def load_npz(file_path):
         encoder_cfg = {key: data[key] for key in data.files}
     return encoder_cfg
 
-def train_svm(x, y, C, max_iter=100, tol=0.001, seed=42):
+def train_svm(x, y, C, max_iter=200000, tol=1e-4, seed=42):
     clf = LinearSVC(C=C, max_iter=max_iter, dual=True, loss="hinge", tol=tol, random_state=seed)
-    with warnings.catch_warnings(record=True) as recorded_warnings:
-        warnings.simplefilter("always", ConvergenceWarning)
-        clf.fit(x, y)
+    clf.fit(x, y)
     W = clf.coef_.copy().ravel()
     b = clf.intercept_.copy()[0]
     return W, b

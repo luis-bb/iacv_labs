@@ -180,4 +180,3 @@ if __name__ == "__main__":
     img3 = testing_imgs / "img4.ppm"
 
     compare_on_images([img1,img2,img3])
-
