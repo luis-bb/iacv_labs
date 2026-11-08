@@ -8,6 +8,7 @@ requested device.
 
 import os
 import warnings
+from pathlib import Path
 from typing import Any, Callable, Dict, Tuple
 
 warnings.filterwarnings("ignore", message="xFormers is available")
@@ -27,6 +28,7 @@ def getModel(
     model_name: str,
     device: str | torch.device = "cpu",
     nofc: bool = True,
+    prefer_local: bool = False,
 ) -> Tuple[nn.Module, Callable[[Any], torch.Tensor]]:
     """Load a pretrained vision model and its input preprocessing pipeline.
 
@@ -36,6 +38,8 @@ def getModel(
         device: Torch device name or device object on which to place the model.
         nofc: Replace the classifier head with ``Identity`` for ResNet-18 and
             ViT-B/32 when true, returning embeddings instead of class logits.
+        prefer_local: For DINOv2, use an existing local Torch Hub checkout
+            before attempting the normal online repository load.
 
     Returns:
         A tuple containing the evaluation-mode model and its preprocessing
@@ -60,7 +64,16 @@ def getModel(
         if nofc:
             model.heads = torch.nn.Identity()  # drop the last layer to get features instead of classification
     elif model_name == "dinov2_vits14":
-        model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+        hub_dir = Path(torch.hub.get_dir())
+        local_repo = hub_dir / "facebookresearch_dinov2_main"
+        if prefer_local and local_repo.is_dir():
+            model = torch.hub.load(
+                str(local_repo), "dinov2_vits14", source="local"
+            )
+        else:
+            model = torch.hub.load(
+                "facebookresearch/dinov2", "dinov2_vits14"
+            )
         preprocess = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
