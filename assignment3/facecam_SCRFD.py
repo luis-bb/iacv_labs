@@ -2,6 +2,7 @@
 import cv2
 import time
 from insightface.app import FaceAnalysis
+from insightface.utils import face_align
 
 # Inicializar SCRFD (apenas deteção facial)
 detector = FaceAnalysis(
@@ -37,7 +38,7 @@ while True:
                     (x1, max(y1 - 10, 20)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (0, 255, 0), 2)
-
+    
     # Calcular FPS
     fps = 1.0 / max(time.perf_counter() - start, 1e-9)
     cv2.putText(frame, f"FPS: {fps:.1f}",
@@ -45,6 +46,23 @@ while True:
                 0.8, (0, 255, 0), 2)
 
     cv2.imshow("SCRFD - Face Detection", frame)
+
+    landmarks = face.kps
+    # Alinhamento facial e crop para cada face detectada
+
+    if landmarks is not None:
+        # Face alignment + crop de 112x112
+        aligned_face = face_align.norm_crop(
+            frame,
+            landmark=landmarks,
+            image_size=112
+        )
+
+        # Mostrar crop alinhado
+        cv2.imshow("Aligned Face", aligned_face)
+
+        # Normalização dos píxeis para [0, 1]
+        normalized_face = aligned_face.astype("float32") / 255.0
 
     # Premir Q para sair
     if cv2.waitKey(1) & 0xFF == ord("q"):
