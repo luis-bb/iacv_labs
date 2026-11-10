@@ -1,0 +1,11 @@
+prompt_id,prompt_text,detail_level,transform,attribute
+L1_motorcycle,a motorcycle,1,,
+L1_motorbike,a motorbike,1,,
+L2_photo,a photo of a motorcycle,2,photo,
+L2_cropped,a cropped image of a motorcycle,2,cropped,
+L2_zoomed,a zoomed-in image of a motorcycle,2,zoomed,
+L2_side_view,a side view of a motorcycle,2,side_view,
+L3_red_cropped,a cropped image of a red motorcycle,3,cropped,red
+L3_red_zoomed,a zoomed-in image of a red motorcycle,3,zoomed,red
+L3_black_photo,a photo of a black motorcycle,3,photo,black
+L3_parked_photo,a photo of a parked motorcycle,3,photo,parked
