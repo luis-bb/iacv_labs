@@ -1,0 +1,10 @@
+# Recommended: Python 3.11 (Windows/Linux). Install in the notebook kernel.
+insightface>=0.7.3,<3
+onnxruntime>=1.18,<2
+opencv-python>=4.8
+numpy>=1.24
+matplotlib>=3.8
+huggingface_hub>=0.26
+pandas>=2.0
+Pillow>=10
+ipykernel>=6
